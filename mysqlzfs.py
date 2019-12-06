@@ -34,7 +34,6 @@ from subprocess import Popen, PIPE, STDOUT, CalledProcessError
 #   need a way to handle this more gracefully
 # ZFS clone and destroy should operate on specific fs and not do recursive 
 #   to avoid snapshoting cloned/imported datasets
-# mysqlbinlog handle keyboardinterrupt
 # binlog purge and compression
 # purge old dumps after s3 upload
 # alert + cleanup stale mysqlds
@@ -77,18 +76,18 @@ def s3_upload(job):
     try:
         MYSQLZFS_S3_CLIENT.head_object(Bucket=bucket, Key=s3key)
 
-        if not os.path.isfile('%s.failed' % file):
+        if not os.path.isfile('%s.s3part' % file):
             return (True, '%s (skipped, already exist)' % s3key)
     except BotoClientError, err:
         pass
 
     try:
         ts_start = time.time()
+        open('%s.s3part' % file, 'a').close()
         MYSQLZFS_S3_CLIENT.upload_file(file, bucket, s3key)
+        os.unlink('%s.s3part' % file)
         return (True, '%s took %fs' % (s3key, round(time.time()-ts_start)))
     except BotoClientError, err:
-        with open('%s.failed' % file, 'a') as failedstat:
-            pass 
         return (False, '%s %s' % (s3key, str(err)))
 
 
@@ -1085,6 +1084,20 @@ class MysqlDumper(object):
             self.logger.info('Dump set %s' % d)
             self.logger.info('+-- Status: %s' % dumps[d]['status'])
             self.logger.info('+-- S3: %s' % dumps[d]['s3'])
+
+    @staticmethod
+    def is_dump_complete(dumpdir):
+        """ Actually, if metadata file exists the dump is deemed complete
+        while it is in progress the file is called metadata.partial
+        """
+        meta_file = os.path.join(dumpdir, 'metadata')
+        if os.path.isfile(meta_file):
+            with open(meta_file) as meta_file_fd:
+                for meta in meta_file_fd:
+                    if 'Finished dump at' in meta:
+                        return True
+
+        return False
 
 
 class MysqlZfsService(object):
@@ -2239,8 +2252,12 @@ class MysqlS3Client(object):
 
         if self.opts.snapshot is not None:
             source_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
-            if not Mydumper.is_dump_complete(source_dir):
-                self.logger.error('Specified dump snapshot is not valid %s' % source_dir)
+            if not MysqlDumper.is_dump_complete(source_dir):
+                self.logger.error('Specified dump directory is not valid %s' % source_dir)
+                return False
+
+            if self.is_upload_complete(source_dir):
+                self.logger.error('Specified dump directory is already on S3 %s' % source_dir)
                 return False
 
             snapshot = self.opts.snapshot
@@ -2251,12 +2268,10 @@ class MysqlS3Client(object):
             for dumpdir in dumpdirs:
                 snapshot = dumpdir
                 source_dir = os.path.join(self.opts.dumpdir, dumpdir)
-                source_meta_file = os.path.join(source_dir, 'metadata')
 
-                if Mydumper.is_dump_complete(source_dir):
+                if MysqlDumper.is_dump_complete(source_dir):
                     self.logger.info('Found complete dump at %s' % source_dir)
-                    s3metadata = self.read_metadata(source_dir)
-                    if s3metadata is None or s3metadata['ts_end'] is None:
+                    if not self.is_upload_complete(source_dir):
                         break
 
                     self.logger.info('Dump directory has already been uploaded to S3')
@@ -2273,6 +2288,7 @@ class MysqlS3Client(object):
         dumpfiles.sort()
         s3key = '%s/%s' % (socket.getfqdn(), self.opts.dataset)
         s3list = []
+        partially_uploaded = False
 
         self.write_metadata(source_dir)
         for dumpfile in dumpfiles:
@@ -2288,6 +2304,19 @@ class MysqlS3Client(object):
                 upload_key = '%s/%s/%s' % (s3key, snapshot, dumpfile)
             else:
                 upload_key = '%s/%s/%s/%s' % (s3key, snapshot, schema[0], dumpfile)
+
+            # If we hit a filename with *.s3part we discard whatever we have so far
+            # it means an S3 upload previously failed up to this file and we
+            # only need to resume from there
+            if re.search('.s3part$', dumpfile):
+                if not partially_uploaded:
+                    self.logger.info('Resuming a previously failed upload')
+                    s3list = []
+                    partially_uploaded = True
+                    # We do this because the actual file precedes the current 
+                    # position and we do not want to skip it.
+                    s3list.append((self.bucket, upload_file[:-7], upload_key[:-7], ))
+                continue
 
             s3list.append((self.bucket, upload_file, upload_key, ))
 
@@ -2363,6 +2392,19 @@ class MysqlS3Client(object):
 
         return True
 
+    def is_upload_complete(self, srcdir):
+        """ Check if a particular cirectory we are upload has already
+        been uploaded to S3
+        """
+        if os.path.isfile(os.path.join(srcdir, 's3metadata')):
+            s3metadata = self.read_metadata(srcdir)
+            if s3metadata is None or s3metadata['ts_end'] is None:
+                return False
+        else:
+            return False
+
+        return True
+
 
 class Zfs(object):
     @staticmethod
@@ -2401,22 +2443,6 @@ class Zfs(object):
                     return filepath
 
         return None
-
-
-class Mydumper(object):
-    @staticmethod
-    def is_dump_complete(dumpdir):
-        """ Actually, if metadata file exists the dump is deemed complete
-        while it is in progress the file is called metadata.partial
-        """
-        meta_file = os.path.join(dumpdir, 'metadata')
-        if os.path.isfile(meta_file):
-            with open(meta_file) as meta_file_fd:
-                for meta in meta_file_fd:
-                    if 'Finished dump at' in meta:
-                        return True
-
-        return False
 
 
 # http://stackoverflow.com/questions/1857346/\
