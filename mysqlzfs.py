@@ -37,14 +37,13 @@ from subprocess import Popen, PIPE, STDOUT, CalledProcessError
 # binlog purge and compression
 # purge old dumps after s3 upload
 # alert + cleanup stale mysqlds
-# default behavior for all commands should be --status, we need to add explicit --run
-# make sure to run script as root only
 # starting mysqlbinlog process should not depend on result of session cleanup
 # When you have zero sized exported snapshot or cleanup on failed send_to_bin
 # Sync scripts failures with proper exit codes
-# prevent multiple instances of the same commands from running i,e, lock files
+# cleanup old lst_._* binlog files
+# binlog gap scanning and report, total count, size and date range
 
-MYSQLZFS_VERSION = 0.1
+MYSQLZFS_VERSION = 0.3
 MYSQLZFS_CMD_SNAP = 'snapshot'
 MYSQLZFS_CMD_EXPORT = 'export'
 MYSQLZFS_CMD_IMPORT = 'import'
@@ -144,6 +143,9 @@ class MysqlZfs(object):
             help='How many threads for parallel jobs i.e. S3 uploads, mydumper')
 
         (opts, args) = parser.parse_args()
+
+        if os.getuid() != 0:
+            parser.error('This tool should only be run as root ... for now')
 
         if opts.dataset is None:
             parser.error('ZFS dataset to manage is required i.e. mysql/root.')
@@ -363,7 +365,7 @@ class MysqlZfs(object):
         if pid is None or pid <= 0:
             return False
 
-        return MysqlZfs.is_process_running(pid)
+        return MysqlZfs.is_process_running(pid), pid
 
     @staticmethod
     def is_process_running(pidno):
@@ -380,6 +382,29 @@ class MysqlZfs(object):
             return True
         else:
             return False
+
+    @staticmethod
+    def mysql_connect(dotmycnf, section='client'):
+
+        try:
+            cnf = MysqlZfs.read_config_file(dotmycnf)
+            if cnf is None:
+                raise Exception('Could not read provided %s' % dotmycnf)
+            elif not cnf.has_option(section, 'host'):
+                section = 'client'
+
+            if not cnf.has_option(section, 'host'):
+                raise Exception('.my.cnf %s group requires host option' % section)
+
+            params = { 'read_default_file': dotmycnf,
+                       'read_default_group': section }
+                       
+            conn = MySQLdb.connect(cnf.get(section, 'host'), **params)
+            # MySQLdb for some reason has autoccommit off by default
+            conn.autocommit(True)
+            return conn
+        except MySQLdb.Error, e:
+            raise Exception('Could not establish connection to MySQL server')
 
 
 class MysqlZfsSnapshotManager(object):
@@ -835,16 +860,9 @@ class MysqlZfsSnapshotManager(object):
 
     def zfs_snapshot(self):
         conn = None
-        params = dict()
-
-        params['read_default_file'] = self.opts.dotmycnf
-        params['read_default_group'] = 'client'
 
         try:
-            conn = MySQLdb.connect('localhost', **params)
-            # MySQLdb for some reason has autoccommit off by default
-            conn.autocommit(True)
-
+            conn = MysqlZfs.mysql_connect(self.opts.dotmycnf, 'zfsmysql')
             cur = conn.cursor(MySQLdb.cursors.DictCursor)
 
             if not self.opts.skipreplcheck:
@@ -907,6 +925,9 @@ class MysqlZfsSnapshotManager(object):
                 conn.close()
 
     def zfs_snapshot_summary(self):
+        if len(self.snaps) <= 0:
+            return False
+
         self.logger.info('Oldest snapshot %s' % self.snaps[0])
         self.logger.info('Latest snapshot %s' % self.snaps[-1])
 
@@ -971,9 +992,10 @@ class MysqlDumper(object):
         self.zfsmgr = zfsmgr
 
         self.lockfile = '/tmp/mysqlzfs-dump-%s.lock' % (re.sub('/', '_', self.opts.dataset))
+        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
 
-        if MysqlZfs.read_lock_file(self.lockfile):
-            raise Exception('Another dump process is running')
+        if self.is_running:
+            raise Exception('Another dump process is running with PID %d' % self.pid)
 
         MysqlZfs.write_lock_file(self.lockfile, self.opts.ppid)
 
@@ -1635,12 +1657,15 @@ class MysqlBinlogStreamer(object):
         if mysqlbinlog is None:
             raise Exception('mysqlbinlog command not found')
 
-        self.logger.info('Starting session pre-cleanup')
-        self.session_cleanup()
-
-        if self.read_lock_file():
+        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
+        if self.is_running:
             self.logger.error('mysqlbinlog process still running with PID %s' % self.pid)
             return False
+        else:
+            self.pid = None
+
+        self.logger.info('Starting session pre-cleanup')
+        self.session_cleanup()
 
         self.ses_binlog_next = self.find_next_binlog()
 
@@ -1676,7 +1701,7 @@ class MysqlBinlogStreamer(object):
                 self.logger.error('Timed out waiting for mysqlbinlog pid')
                 return False
 
-            self.write_lock_file()
+            MysqlZfs.write_lock_file(self.lockfile, self.pid)
 
             while time.time() < end_ts:
                 # Cleanup every minute
@@ -1867,10 +1892,11 @@ class MysqlBinlogStreamer(object):
                 self.srv_connect_ctl()
                 row = self.srv_cursor_fetchone(sql)
             else:
-                traceback.print_exc()
+                if self.opts.debug:
+                    traceback.print_exc()
                 self.logger.error(str(err))
                 self.logger.debug(sql)
-                self.logger.debug('Binlog does not exist on server [%s]' % binlog)
+                self.logger.error('Binlog does not exist on server [%s]' % binlog)
                 return False
 
         self.logger.debug('Binlog exists on server [%s]' % str(row))
@@ -1972,66 +1998,6 @@ class MysqlBinlogStreamer(object):
 
     def unzip(self, binlog):
         pass
-
-    def write_state(self):
-        """ Write the binlog streamer state file
-        last_binlog - last binlog written
-        oldest_binlog_file - oldest binlog filename
-        oldest_binlog_date - oldest binlog creation date, written when zip() is called
-        pid_file
-        """
-        pass
-
-    def read_state(self):
-        """ Read and cache statefile
-        """
-        pass
-
-    def write_lock_file(self):
-        with open(self.lockfile, 'w') as lockfd:
-            lockfd.write(str(self.pid))
-
-        lockfd.close()
-        return True
-
-    def read_lock_file(self):
-        """ Check if lock file exists and returns the pidno of the binlog 
-        process. If binlog process is dead, delete lock file and return None
-        """
-        
-        if not os.path.isfile(self.lockfile):
-            return False
-
-        with open(self.lockfile, 'r') as lockfd:
-            for pidline in lockfd:
-                try:
-                    self.pid = int(pidline)
-                    if self.pid == 0:
-                        continue
-                    break
-                except ValueError, err:
-                    self.logger.error('Invalid PID value (%s) from lock file %s' % (
-                                      str(pidline), self.lockfile))
-                    return False
-                finally:
-                    lockfd.close()
-
-        return self.is_process_running()
-
-    def is_process_running(self):
-        """ Check for /proc/PID/status
-        - If it exists, if not process is dead, return True
-        - If exists and process state is Z, return False
-        - 
-        TODO: Check also that that process is not in zombie?
-        """
-        if self.pid is None:
-            return False
-
-        if MysqlZfs.proc_status(self.pid) is not None:
-            return True
-        else:
-            return False
 
 
 class MysqlZfsServiceList(object):
@@ -2165,10 +2131,12 @@ class MysqlS3Client(object):
         self.s3 = boto3.client('s3')
         self.ts_start = time.time()
         self.ts_end = None
+        self.ignorelist = ['metadata', 'metadata.partial', 's3metadata', 's3metadata.partial']
         self.lockfile = '/tmp/mysqlzfs-s3-%s.lock' % (re.sub('/', '_', self.opts.dataset))
+        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
 
-        if MysqlZfs.read_lock_file(self.lockfile):
-            raise Exception('Another S3 upload process is running')
+        if self.is_running:
+            raise Exception('Another S3 upload process is running with PID %d' % self.pid)
 
         MysqlZfs.write_lock_file(self.lockfile, self.opts.ppid)
 
@@ -2253,12 +2221,12 @@ class MysqlS3Client(object):
         if self.opts.snapshot is not None:
             source_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
             if not MysqlDumper.is_dump_complete(source_dir):
-                self.logger.error('Specified dump directory is not valid %s' % source_dir)
+                self.logger.error('%s is not valid dump directory' % source_dir)
                 return False
 
             if self.is_upload_complete(source_dir):
-                self.logger.error('Specified dump directory is already on S3 %s' % source_dir)
-                return False
+                self.logger.info('%s upload is already complete, exiting' % source_dir)
+                return True
 
             snapshot = self.opts.snapshot
         else:
@@ -2270,29 +2238,28 @@ class MysqlS3Client(object):
                 source_dir = os.path.join(self.opts.dumpdir, dumpdir)
 
                 if MysqlDumper.is_dump_complete(source_dir):
-                    self.logger.info('Found complete dump at %s' % source_dir)
                     if not self.is_upload_complete(source_dir):
                         break
 
-                    self.logger.info('Dump directory has already been uploaded to S3')
+                    self.logger.info('%s upload is already complete, skipping' % source_dir)
                     source_dir = None
                 else:
-                    self.logger.info('Skipping incomplete dump at %s' % source_dir)
+                    self.logger.warn('%s is an incomplete dump, skipping' % source_dir)
                     source_dir = None
 
         if source_dir is None:
-            self.logger.error('No valid dump found to upload')
-            return False
+            self.logger.info('No valid dump directory found to upload')
+            return True
 
         dumpfiles = os.listdir(source_dir)
         dumpfiles.sort()
-        s3key = '%s/%s' % (socket.getfqdn(), self.opts.dataset)
+        s3key = '%s/%s/dump' % (socket.getfqdn(), self.opts.dataset)
         s3list = []
         partially_uploaded = False
 
         self.write_metadata(source_dir)
         for dumpfile in dumpfiles:
-            if dumpfile in ['metadata', 'metadata.partial', 's3metadata', 's3metadata.partial']:
+            if dumpfile in self.ignorelist:
                 continue
 
             upload_file = os.path.join(source_dir, dumpfile)
@@ -2308,7 +2275,7 @@ class MysqlS3Client(object):
             # If we hit a filename with *.s3part we discard whatever we have so far
             # it means an S3 upload previously failed up to this file and we
             # only need to resume from there
-            if re.search('.s3part$', dumpfile):
+            if re.search('\.s3(last|part)$', dumpfile):
                 if not partially_uploaded:
                     self.logger.info('Resuming a previously failed upload')
                     s3list = []
@@ -2337,8 +2304,122 @@ class MysqlS3Client(object):
         self.ts_end = time.time()
         self.write_metadata(source_dir)
 
+    def scandir_binlog_hosts(self):
+        hostdirs = []
+        lsout = os.listdir(self.opts.binlogdir)
+
+        if len(lsout) == 0:
+            return hostdirs
+
+        lsout.sort()
+
+        for host in lsout:
+            if not os.path.isdir(os.path.join(self.opts.binlogdir, host)):
+                continue
+
+            hostdirs.append(host)
+
+        return hostdirs
+
+    def scandir_binlog_days(self, host):
+        binlogdays = []
+        lsout = os.listdir(os.path.join(self.opts.binlogdir, host))
+
+        if len(lsout) == 0:
+            return hostdirs
+
+        lsout.sort()
+
+        for daydir in lsout:
+            binlogdir = os.path.join(self.opts.binlogdir, host, daydir)
+            
+            if self.is_upload_complete(binlogdir):
+                self.logger.debug('%s upload is already complete, skipping' % binlogdir)
+                continue
+
+            if not os.path.isdir(binlogdir):
+                continue
+
+            # daydir should be datetime format
+            if not re.search('^20\d{6}$', daydir):
+                self.logger.debug('%s does not match, skipping' % binlogdir)
+                continue
+
+            binlogdays.append(daydir)
+
+        return binlogdays
+
+    def scandir_binlogs(self, host, day):
+        binlogdir = os.path.join(self.opts.binlogdir, host, day)
+        self.logger.debug('Scanning %s' % binlogdir)
+        lsout = os.listdir(binlogdir)
+        lsout.sort()
+        partially_uploaded = False
+        binlogs = []
+        s3key = '%s/%s/binlog' % (socket.getfqdn(), self.opts.dataset)
+
+        for binlog in lsout:
+            if binlog in self.ignorelist:
+                continue
+
+            upload_file = os.path.join(binlogdir, binlog)
+            upload_key = '%s/%s/%s' % (s3key, day, binlog)
+
+            if re.search('\.s3(last|part)$', binlog):
+                if not partially_uploaded:
+                    binlogs = []
+                    partially_uploaded = True
+                    binlogs.append((self.bucket, upload_file[:-7], upload_key[:-7], ))
+                continue
+
+            binlogs.append((self.bucket, upload_file, upload_key, ))
+
+        return binlogs
+
+    def upload_binlogs_host(self, host):
+        self.logger.info('Scanning for binlog from %s' % host)
+        binlogdays = self.scandir_binlog_days(host)
+        s3last = None
+
+        if len(binlogdays) == 0:
+            self.logger.info('No binlog directories to upload from %s' % host)
+            return True
+
+        s3list = OrderedDict()
+        for day in binlogdays:
+            binlogdir = os.path.join(self.opts.binlogdir, host, day)
+            binlogs = self.scandir_binlogs(host, day)
+
+            self.logger.info('Uploading %d objects from %s/%s' % (len(binlogs), host, day))
+            #print(binlogs)
+            self.upload_chunks(binlogs)
+
+            s3bucket, s3file, s3key = binlogs[0]
+            if os.path.isfile('%s.s3last' % s3file):
+                os.unlink('%s.s3last' % s3file)
+
+            # Make sure to mark our last binlog to know where we resume next time
+            s3bucket, s3file, s3key = binlogs[-1]
+            open('%s.s3last' % s3file, 'a').close()
+
+            if s3last is not None and os.path.isfile(s3last):
+                os.unlink(s3last)
+
+            s3last = '%s.s3last' % s3file
+
+            self.ts_end = time.time()
+            self.write_metadata(binlogdir)
+
+        return True
+
     def upload_binlogs(self):
-        pass
+        hostdirs = self.scandir_binlog_hosts()
+        if len(hostdirs) == 0:
+            self.logger.error('No binlog directories to upload at this time')
+            return False
+
+        for host in hostdirs:
+            self.upload_binlogs_host(host)
 
     def read_metadata(self, dumpdir):
         metadata = OrderedDict()
@@ -2514,6 +2595,7 @@ if __name__ == "__main__":
             s3 = MysqlS3Client(logger, opts)
             if opts.run:
                 s3.upload_dumps()
+                s3.upload_binlogs()
             else:
                 logger.info('S3 command does not have status subcommand yet')
         elif opts.cmd == MYSQLZFS_CMD_BINLOGD:
