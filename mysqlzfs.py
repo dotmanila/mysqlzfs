@@ -83,7 +83,8 @@ def s3_upload(job):
     try:
         ts_start = time.time()
         open('%s.s3part' % file, 'a').close()
-        MYSQLZFS_S3_CLIENT.upload_file(file, bucket, s3key)
+        MYSQLZFS_S3_CLIENT.upload_file(file, bucket, s3key,
+                                       ExtraArgs={'StorageClass': 'STANDARD_IA'})
         os.unlink('%s.s3part' % file)
         return (True, '%s took %fs' % (s3key, round(time.time()-ts_start)))
     except BotoClientError, err:
@@ -347,7 +348,7 @@ class MysqlZfs(object):
         pid = None
         
         if not os.path.isfile(lockfile):
-            return False
+            return False, pid
 
         with open(lockfile, 'r') as lockfd:
             for pidline in lockfd:
@@ -357,13 +358,13 @@ class MysqlZfs(object):
                         continue
                     break
                 except ValueError, err:
-                    return False
+                    return False, pid
                 finally:
                     lockfd.close()
                     break
 
         if pid is None or pid <= 0:
-            return False
+            return False, pid
 
         return MysqlZfs.is_process_running(pid), pid
 
