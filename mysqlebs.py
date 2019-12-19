@@ -306,7 +306,9 @@ class MysqlEbsSnapshotManager(object):
         self.instance_id = self.ec2_instance_id()
         self.logger.info('This node\'s instance-id is %s' % self.instance_id)
 
-        self.volume_ids = self.opts.volume_ids.strip().split(',')
+        self.volume_ids = None
+        if self.opts.volume_ids is not None:
+            self.opts.volume_ids.strip().split(',')
 
     def ec2_instance_id(self):
         metadata_url = 'http://169.254.169.254/latest/meta-data/instance-id'
@@ -367,7 +369,7 @@ class MysqlEbsSnapshotManager(object):
             resp = self.ec2.create_snapshots(Description=desc, 
                                              InstanceSpecification=instance_spec,
                                              TagSpecifications=tags,
-                                             DryRun=True,
+                                             DryRun=False,
                                              CopyTagsFromSource='volume')
             self.logger.debug(resp)
             return True
@@ -393,7 +395,7 @@ class MysqlEbsSnapshotManager(object):
 
     def create_snapshot(self):
         conn = None
-        if not self.ec2_volumes_exists():
+        if self.volume_ids is not None and not self.ec2_volumes_exists():
             raise Exception('Specified volume-id(s) does not belong to this instance')
 
         try:
