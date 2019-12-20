@@ -16,7 +16,9 @@ from ConfigParser import ConfigParser, NoOptionError
 from botocore.exceptions import ClientError as BotoClientError
 from collections import OrderedDict
 from datetime import datetime, timedelta
+from glob import glob
 from optparse import OptionParser
+from subprocess import Popen, PIPE
 
 # INSTALL
 # We need pip as there is a bug on older requests module version
@@ -66,8 +68,14 @@ class MysqlZfs(object):
         parser.add_option('-x', '--run', dest='run', action="store_true", 
             help='Run the default actions for a command i.e. for s3 is upload',
             default=False)
+        parser.add_option('-z', '--skip-fsfreeze', dest='skip_fsfreeze', action="store_true", 
+            help='Wether to skip calling fsfreeze before snapshotting',
+            default=False)
 
         (opts, args) = parser.parse_args()
+
+        if os.getuid() != 0:
+            parser.error('This tool should only be run as root i.e. to use fsfreeze')
         
         cmds = [MYSQLEBS_CMD_SNAP, MYSQLEBS_CMD_VOLS]
         if len(args) == 1 and args[0] not in cmds:
@@ -310,6 +318,10 @@ class MysqlEbsSnapshotManager(object):
         if self.opts.volume_ids is not None:
             self.opts.volume_ids.strip().split(',')
 
+        # We keep track of any frozen mounts to make sure we unfreeze them in 
+        # in case of exceptions
+        self.frozen_mounts = dict()
+
     def ec2_instance_id(self):
         metadata_url = 'http://169.254.169.254/latest/meta-data/instance-id'
         try:
@@ -393,14 +405,86 @@ class MysqlEbsSnapshotManager(object):
         """ Delete snapshots older than N days.
         """
 
+    def os_physical_drives(self):
+        drive_glob = '/sys/block/*/device'
+        return [os.path.basename(os.path.dirname(d)) for d in glob(drive_glob)]
+
+    def os_partitions(self, disk):
+        if disk.startswith('.') or '/' in disk:
+            raise ValueError('Invalid disk name {0}'.format(disk))
+        partition_glob = '/sys/block/{0}/*/start'.format(disk)
+        return [os.path.basename(os.path.dirname(p)) for p in glob(partition_glob)]
+
+    def os_mountpoint_from_devs(self):
+        drives = self.os_physical_drives()
+        devs = []
+        for drive in drives:
+            devs += self.os_partitions(drive)
+
+        mounts = dict()
+        out = None
+        err = None
+
+        for dev in devs:
+            cmd = ['/bin/lsblk', '-o', 'MOUNTPOINT', '-r', '-n', '/dev/%s' % dev]
+            self.logger.debug(cmd)
+            p = Popen(cmd, stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            if err is not '':
+                raise Exception(err)
+
+            out_raw = out.split('\n')
+            mount = out_raw[0].decode('utf-8').strip()
+            if mount not in mounts:
+                mounts[mount] = mount
+
+        return mounts
+
+    def os_fs_freeze(self, mountpoints):
+        self.frozen_mounts = dict()
+
+        for mountpoint in mountpoints:
+            cmd = ['/sbin/fsfreeze', '--freeze', mountpoint]
+            self.logger.debug(cmd)
+            p = Popen(cmd, stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            if err is not '':
+                raise Exception(err)
+
+            self.frozen_mounts[mountpoint] = mountpoint
+
+        return True
+
+    def os_fs_unfreeze(self, mountpoints):
+        for mountpoint in mountpoints:
+            cmd = ['/sbin/fsfreeze', '--unfreeze', mountpoint]
+            self.logger.debug(cmd)
+            p = Popen(cmd, stdout=PIPE, stderr=PIPE)
+            out, err = p.communicate()
+            if err is not '':
+                raise Exception(err)
+
+            if mountpoint in self.frozen_mounts:
+                del self.frozen_mounts[mountpoint]
+
+        return True
+
     def create_snapshot(self):
         conn = None
+        frozen_boot = False
+
         if self.volume_ids is not None and not self.ec2_volumes_exists():
             raise Exception('Specified volume-id(s) does not belong to this instance')
 
         try:
             conn = MysqlZfs.mysql_connect(self.opts.dotmycnf, 'mysqlebs')
             cur = conn.cursor(MySQLdb.cursors.DictCursor)
+
+            mounts = self.os_mountpoint_from_devs()
+            if not self.opts.skip_fsfreeze:
+                if '/' in mounts:
+                    self.logger.warn('Root volume (/) found on list of mounts, skipping')
+                    del mounts['/']
 
             if not self.opts.skipreplcheck:
                 cur.execute('SHOW SLAVE STATUS')
@@ -415,22 +499,24 @@ class MysqlEbsSnapshotManager(object):
                 if row['Slave_IO_Running'] != 'Yes' or row['Slave_SQL_Running'] != 'Yes':
                     raise Exception('Replication thread(s) are not running')
 
-            if self.opts.skipreplcheck:
-                self.logger.debug('Locking tables for backup')
-                cur.execute('LOCK TABLES FOR BACKUP')
-            else:
+            if not self.opts.skipreplcheck:
                 self.logger.debug('Stopping SQL thread')
                 cur.execute('STOP SLAVE SQL_THREAD')
-                self.logger.debug('Flushing tables')
-                cur.execute('FLUSH TABLES')
+
+            self.logger.debug('Flushing tables (with read lock)')
+            cur.execute('FLUSH TABLES WITH READ LOCK')
+
+            if len(mounts) > 0 and not self.opts.skip_fsfreeze:
+                self.logger.info('Freezing the following mountpoints %s' % '|'.join(mounts))
+                self.os_fs_freeze(mounts)
 
             snapname = datetime.today().strftime('%Y%m%d%H%M%S')
             self.logger.debug('Taking snapshot')
             self.ec2_create_snapshot(snapname)
 
-            self.logger.info('Snapshot %s complete' % snapname)
-            self.logger.info('Pruning old snapshots')
-            self.ec2_prune_old_snapshots()
+            if len(self.frozen_mounts) > 0 and not self.opts.skip_fsfreeze:
+                self.logger.info('Un-freezing the following mountpoints %s' % '|'.join(mounts))
+                self.os_fs_unfreeze(self.frozen_mounts)
 
         except MySQLdb.Error, e:
             self.logger.error('A MySQL error has occurred, aborting new snapshot')
@@ -450,6 +536,13 @@ class MysqlEbsSnapshotManager(object):
 
                 cur.close()
                 conn.close()
+
+            if len(self.frozen_mounts) > 0 and not self.opts.skip_fsfreeze:
+                self.os_fs_unfreeze(self.frozen_mounts)
+
+        self.logger.info('Snapshot %s complete' % snapname)
+        self.logger.info('Pruning old snapshots')
+        self.ec2_prune_old_snapshots()
 
     def snapshots_summary(self):
         """ Listing end to end snapshot summary from AWS via
