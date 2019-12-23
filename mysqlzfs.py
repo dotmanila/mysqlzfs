@@ -142,6 +142,10 @@ class MysqlZfs(object):
             default=False)
         parser.add_option('-t', '--threads', dest='threads', type='int',
             help='How many threads for parallel jobs i.e. S3 uploads, mydumper')
+        parser.add_option('-m', '--metrics-text-dir', dest='metrics_text_dir', type='string', 
+            help='Emit textfile metrics to this directory for node_exporter',
+            default=None)
+
 
         (opts, args) = parser.parse_args()
 
@@ -159,6 +163,9 @@ class MysqlZfs(object):
             parser.error('Backups directory is required')
         elif not os.path.isdir(opts.backupdir):
             parser.error('Backups directory does not exist')
+
+        if opts.metrics_text_dir is not None and not os.path.isdir(opts.metrics_text_dir):
+            parser.error('Specified metrics textfile directory does not exist')
 
         opts.dataset = opts.dataset.strip('/')
 
@@ -407,6 +414,36 @@ class MysqlZfs(object):
         except MySQLdb.Error, e:
             raise Exception('Could not establish connection to MySQL server')
 
+    @staticmethod
+    def emit_text_metric(name, value, textdir):
+        if textdir is None:
+            return True
+
+        file = '%s/mysqlzfs.prom' % textdir
+        wrote = False
+        write = []
+
+        if not os.path.isfile(file):
+            write.append('%s %s' % (name, value))
+            wrote = True
+        else:
+            with open(file, 'r') as fd:
+                metrics = fd.readlines()
+                for metric in metrics:
+                    if '%s ' % name in metric:
+                        write.append('%s %s\n' % (name, value))
+                        wrote = True
+                    else:
+                        write.append('%s\n' % metric.rstrip())
+
+            if not wrote:
+                write.append('%s %s\n' % (name, value))
+
+        with open(file, 'w') as fd:
+            fd.writelines(write)
+
+        return True
+
 
 class MysqlZfsSnapshotManager(object):
     def __init__(self, logger, opts):
@@ -605,6 +642,10 @@ class MysqlZfsSnapshotManager(object):
         if r != 0:
             self.logger.error('ZFS send command failed with code: %d' % r)
             return False
+
+        MysqlZfs.emit_text_metric(
+            'mysqlzfs_last_export{dataset="%s"}' % self.opts.dataset, 
+            int(time.time()), self.opts.metrics_text_dir)
 
         return True
 
@@ -901,6 +942,11 @@ class MysqlZfsSnapshotManager(object):
                 return False
 
             self.logger.info('Snapshot %s@s%s complete' % (self.opts.dataset, snapname))
+
+            MysqlZfs.emit_text_metric(
+                'mysqlzfs_last_snapshot{dataset="%s"}' % self.opts.dataset, 
+                int(time.time()), self.opts.metrics_text_dir)
+
             self.logger.info('Pruning %d old snapshots' % len(self.snaps[:-431]))
             for s in self.snaps[:-431]:
                 self.logger.debug(' - %s@s%s' % (self.opts.dataset, s))
@@ -1074,6 +1120,10 @@ class MysqlDumper(object):
             return False
 
         self.logger.info('mydumper process completed')
+
+        MysqlZfs.emit_text_metric(
+            'mysqlzfs_last_dump{dataset="%s"}' % self.opts.dataset, 
+            int(time.time()), self.opts.metrics_text_dir)
 
         return True
 
@@ -1724,6 +1774,9 @@ class MysqlBinlogStreamer(object):
                 p.kill()
             elif r != 0:
                 self.logger.error("mysqlbinlog exited error code %s" % str(r))
+                MysqlZfs.emit_text_metric(
+                    'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
+                    int(time.time()), self.opts.metrics_text_dir)
 
             if FNULL is not None:
                 FNULL.close()
@@ -1731,10 +1784,17 @@ class MysqlBinlogStreamer(object):
             os.chdir(opts.pcwd)
         except Exception, e:
             self.logger.error("mysqlbinlog died with error %s" % str(e))
+            MysqlZfs.emit_text_metric(
+                'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
+                int(time.time()), self.opts.metrics_text_dir)
             raise
 
         self.logger.info('Starting session post-cleanup')
         self.session_cleanup()
+
+        MysqlZfs.emit_text_metric(
+            'mysqlzfs_last_binlogd_ok{dataset="%s"}' % self.opts.dataset, 
+            int(time.time()), self.opts.metrics_text_dir)
 
         return True
 
