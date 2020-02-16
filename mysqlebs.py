@@ -22,13 +22,15 @@ from subprocess import Popen, PIPE
 
 # INSTALL
 # We need pip as there is a bug on older requests module version
-#   pip install awscli requests -U
+#   sudo apt install libmysqlclient-dev
+#   pip install awscli requests boto3 mysql psutil -U
 # Make sure [mysqlebs] section exists on /root/.my.cnf (or specify --dotmycnf)
 # Make sure aws configure is ran (~/.aws/[config|credentials] exists)
 
 MYSQLEBS_VERSION = 0.3
 MYSQLEBS_CMD_SNAP = 'snapshot'
 MYSQLEBS_CMD_VOLS = 'identify-volumes'
+MYSQLEBS_CMD_PURGE = 'purge'
 
 MYSQLEBS_SIGTERM_CAUGHT = False
 
@@ -62,22 +64,26 @@ class MysqlZfs(object):
         parser.add_option('-c', '--defaults-file', dest='dotmycnf', type='string', 
             help='Path to .my.cnf containing connection credentials to MySQL',
             default='/root/.my.cnf')
+        parser.add_option('-L', '--log', dest='log', type='string', 
+            help='Log output to specified file',
+            default=None)
         parser.add_option('-r', '--skip-repl-check', dest='skipreplcheck', action="store_true", 
             help='Wether to skip replication check when taking the snapshot',
             default=False)
         parser.add_option('-x', '--run', dest='run', action="store_true", 
-            help='Run the default actions for a command i.e. for s3 is upload',
+            help=('Execute the given subcommand i.e. passing snapshot alone does not do '
+                  'anything without --run.'),
+            default=False)
+        parser.add_option('-X', '--dry-run', dest='dryrun', action="store_true", 
+            help=('Show what the script will be doing instead of actually doing it'),
             default=False)
         parser.add_option('-z', '--skip-fsfreeze', dest='skip_fsfreeze', action="store_true", 
             help='Wether to skip calling fsfreeze before snapshotting',
             default=False)
 
         (opts, args) = parser.parse_args()
-
-        if os.getuid() != 0:
-            parser.error('This tool should only be run as root i.e. to use fsfreeze')
         
-        cmds = [MYSQLEBS_CMD_SNAP, MYSQLEBS_CMD_VOLS]
+        cmds = [MYSQLEBS_CMD_SNAP, MYSQLEBS_CMD_VOLS, MYSQLEBS_CMD_PURGE]
         if len(args) == 1 and args[0] not in cmds:
             parser.error("Command not recognized, got '%s'. See more with --help" % args[0])
         elif len(args) <= 0:
@@ -86,6 +92,9 @@ class MysqlZfs(object):
             parser.error("Multiple commands specified. See more with --help")
         else:
             opts.cmd = args[0]
+
+        if os.getuid() != 0 and not opts.skip_fsfreeze and opts.cmd == MYSQLEBS_CMD_SNAP:
+            parser.error('This tool should only be run as root i.e. to use fsfreeze')
 
         if opts.all_volumes or opts.all_volumes_noboot:
             if opts.volume_ids is not None:
@@ -110,21 +119,24 @@ class MysqlZfs(object):
         if not os.path.isdir(os.path.dirname(logfile)):
             os.mkdir(os.path.dirname(logfile))
 
+        logger = logging.getLogger('mysqlebs')
+
         loglevel = None
         if opts.debug:
             loglevel = logging.DEBUG
         else:
             loglevel = logging.INFO
 
-        logging.basicConfig(filename=logfile, level=loglevel, format=logformat)
-
-        logger = logging.getLogger('mysqlebs')
-        
         if sys.stdout.isatty():
             log_stream = logging.StreamHandler(sys.stdout)
             log_stream.setLevel(logger.getEffectiveLevel())
             log_stream.setFormatter(logging.Formatter(fmt=logformat))
             logger.addHandler(log_stream)
+
+        if opts.log is None:
+            logging.basicConfig(stream=None, level=loglevel, format=logformat)
+        else:
+            logging.basicConfig(filename=logfile, level=loglevel, format=logformat)
 
         return logger
 
@@ -321,6 +333,7 @@ class MysqlEbsSnapshotManager(object):
         # We keep track of any frozen mounts to make sure we unfreeze them in 
         # in case of exceptions
         self.frozen_mounts = dict()
+        self.volumes = self.ec2_list_ebs_volumes(self.instance_id)
 
     def ec2_instance_id(self):
         metadata_url = 'http://169.254.169.254/latest/meta-data/instance-id'
@@ -355,19 +368,24 @@ class MysqlEbsSnapshotManager(object):
 
         return True
 
-    def ec2_create_snapshot(self, ts=None):
+    def ec2_create_snapshot(self):
         """ aws ec2 create-snapshot
         """
-        if ts is None:
-            ts = datetime.today().strftime('%Y%m%d%H%M%S')
+        if self.opts.dryrun:
+            return True
 
-        desc = '%s mysqlebs Snapshot' % ts
+        ts_today = datetime.today()
+        ts_epoch = int(time.mktime(ts_today.timetuple()))
+        ts_epoch_exp = ts_epoch+(self.opts.retention_days * 24 * 60 * 60)
+
+        desc = '%s mysqlebs Snapshot' % ts_today.strftime('%Y-%m-%d_%H_%M_%S')
 
         tags = [{
             'ResourceType': 'snapshot', 
             'Tags': [
                 {'Key': 'mysqlebs-desc', 'Value': desc},
-                {'Key': 'mysqlebs-ts', 'Value': ts}
+                {'Key': 'mysqlebs-ts', 'Value': str(ts_epoch)},
+                {'Key': 'mysqlebs-exp', 'Value': str(ts_epoch_exp)}
             ]
         }]
 
@@ -395,15 +413,67 @@ class MysqlEbsSnapshotManager(object):
 
         return True
 
-
-
     def ec2_list_ebs_snapshots(self):
         """ List available EBS snapshots. 
         """
 
+    def ec2_mark_expired_snapshots(self):
+        ts_today = datetime.today()
+        ts_epoch = int(time.mktime(ts_today.timetuple()))
+        snap_exp_epoch = ts_epoch
+        snap_exp_ts = ts_today
+        expired_snapshots = []
+
+        for vol in self.volumes:
+            # We tag the snapshots with its local device name as well to be reconstructed later
+            # especially for RAID devices
+            mysqlebs_dev_exists = False
+
+            self.logger.info('Checking for expired snapshots on VolumeId: %s' % vol['VolumeId'])
+            filters = [{'Name':'tag-key','Values':['mysqlebs-ts']},
+                       {'Name':'volume-id','Values':[vol['VolumeId']]}]
+
+            snapshots = self.ec2.describe_snapshots(Filters=filters, MaxResults=1000)
+            for snapshot in snapshots['Snapshots']:
+                for tag in snapshot['Tags']:
+                    if tag['Key'] == 'mysqlebs-dev':
+                        mysqlebs_dev_exists = True
+
+                    if tag['Key'] != 'mysqlebs-exp':
+                        continue
+
+                    snap_exp_epoch = int(tag['Value'])
+                    snap_exp_ts = datetime.utcfromtimestamp(snap_exp_epoch).strftime('%Y-%m-%d %H:%M:%S')
+
+                    if snap_exp_epoch < ts_epoch:
+                        self.logger.info('SnapshotID %s expired on %s' % (snapshot['SnapshotId'], snap_exp_ts))
+                        expired_snapshots.append(snapshot['SnapshotId'])
+
+                if not mysqlebs_dev_exists and not self.opts.dryrun:
+                    self.logger.info('Adding device tag %s to snapshot %s' % (
+                        vol['Attachments'][0]['Device'], snapshot['SnapshotId']))
+                    self.ec2.create_tags(
+                        Resources=[snapshot['SnapshotId']], 
+                        Tags=[{'Key':'mysqlebs-dev','Value':vol['Attachments'][0]['Device']}])
+
+        if not self.opts.dryrun and len(expired_snapshots) > 0:
+            self.ec2.create_tags(Resources=expired_snapshots, Tags=[{'Key':'mysqlebs-expired','Value':'true'}])
+
+    def ec2_list_expired_snapshots(self):
+        filters = [{'Name':'tag:mysqlebs-expired','Values':['true']}]
+        snapshots = self.ec2.describe_snapshots(Filters=filters,MaxResults=1000)
+        return snapshots['Snapshots']
+
+    def ec2_delete_snapshot(self, snapshotid):
+        if self.opts.dryrun:
+            return True
+
+        return self.ec2.delete_snapshot(SnapshotId=snapshotid)
+
     def ec2_prune_old_snapshots(self):
         """ Delete snapshots older than N days.
         """
+        pass
 
     def os_physical_drives(self):
         drive_glob = '/sys/block/*/device'
@@ -441,6 +511,9 @@ class MysqlEbsSnapshotManager(object):
         return mounts
 
     def os_fs_freeze(self, mountpoints):
+        if self.opts.dryrun:
+            return True
+
         self.frozen_mounts = dict()
 
         for mountpoint in mountpoints:
@@ -456,6 +529,9 @@ class MysqlEbsSnapshotManager(object):
         return True
 
     def os_fs_unfreeze(self, mountpoints):
+        if self.opts.dryrun:
+            return True
+
         for mountpoint in mountpoints:
             cmd = ['/sbin/fsfreeze', '--unfreeze', mountpoint]
             self.logger.debug(cmd)
@@ -501,18 +577,20 @@ class MysqlEbsSnapshotManager(object):
 
             if not self.opts.skipreplcheck:
                 self.logger.debug('Stopping SQL thread')
-                cur.execute('STOP SLAVE SQL_THREAD')
+                if not self.opts.dryrun:
+                    cur.execute('STOP SLAVE SQL_THREAD')
 
-            self.logger.debug('Flushing tables (with read lock)')
-            cur.execute('FLUSH TABLES WITH READ LOCK')
+            self.logger.info('Flushing tables (with read lock)')
+            if not self.opts.dryrun:
+                cur.execute('FLUSH TABLES WITH READ LOCK')
 
             if len(mounts) > 0 and not self.opts.skip_fsfreeze:
                 self.logger.info('Freezing the following mountpoints %s' % '|'.join(mounts))
                 self.os_fs_freeze(mounts)
 
-            snapname = datetime.today().strftime('%Y%m%d%H%M%S')
             self.logger.debug('Taking snapshot')
-            self.ec2_create_snapshot(snapname)
+
+            self.ec2_create_snapshot()
 
             if len(self.frozen_mounts) > 0 and not self.opts.skip_fsfreeze:
                 self.logger.info('Un-freezing the following mountpoints %s' % '|'.join(mounts))
@@ -529,10 +607,12 @@ class MysqlEbsSnapshotManager(object):
 
                 if self.opts.skipreplcheck:
                     self.logger.debug('Unlocking tables')
-                    cur.execute('UNLOCK TABLES')
+                    if not self.opts.dryrun:
+                        cur.execute('UNLOCK TABLES')
                 else:
                     self.logger.debug('Resuming replication')
-                    cur.execute('START SLAVE')
+                    if not self.opts.dryrun:
+                        cur.execute('START SLAVE')
 
                 cur.close()
                 conn.close()
@@ -540,9 +620,9 @@ class MysqlEbsSnapshotManager(object):
             if len(self.frozen_mounts) > 0 and not self.opts.skip_fsfreeze:
                 self.os_fs_unfreeze(self.frozen_mounts)
 
-        self.logger.info('Snapshot %s complete' % snapname)
-        self.logger.info('Pruning old snapshots')
-        self.ec2_prune_old_snapshots()
+        self.logger.info('Snapshot complete')
+        self.logger.info('Scanning for expired snapshots')
+        self.ec2_mark_expired_snapshots()
 
     def snapshots_summary(self):
         """ Listing end to end snapshot summary from AWS via
@@ -566,12 +646,27 @@ class MysqlEbsSnapshotManager(object):
         pass
 
     def list_volumes(self):
-        vols = self.ec2_list_ebs_volumes(instance_id)
+        vols = self.ec2_list_ebs_volumes(self.instance_id)
         self.logger.debug(vols)
 
         for vol in vols:
             self.logger.info('VolumeId: %s, Type: %s, Device: %s' % (
                 vol['VolumeId'], vol['VolumeType'], vol['Attachments'][0]['Device']))
+
+    def purge_expired_snapshots(self):
+        self.logger.info('Checking for expired snapshots (mysqlebs-expired:true)')
+        snapshots = self.ec2_list_expired_snapshots()
+        
+        if len(snapshots) > 0:
+            for snapshot in snapshots:
+                for tag in snapshot['Tags']:
+                    if tag['Key'] == 'mysqlebs-expired' and tag['Value'] == 'true':
+                        self.logger.info('Found VolumeId %s SnapshotId %s Description %s' % (
+                            snapshot['VolumeId'], snapshot['SnapshotId'], snapshot['Description']))
+                        self.ec2_delete_snapshot(snapshot['SnapshotId'])
+                        break
+
+        self.logger.info('No more snapshots to prune')
 
 
 # http://stackoverflow.com/questions/1857346/\
@@ -598,6 +693,8 @@ if __name__ == "__main__":
                 ebsmgr.create_snapshot()
             else:
                 ebsmgr.snapshots_summary()
+        elif opts.cmd == MYSQLEBS_CMD_PURGE:
+            ebsmgr.purge_expired_snapshots()
         elif opts.cmd == MYSQLEBS_CMD_VOLS:
             ebsmgr.list_volumes()
         else:
