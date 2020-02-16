@@ -113,12 +113,7 @@ class MysqlZfs(object):
     @staticmethod
     def create_logger(opts):
         logger = None
-        logfile = os.path.join('/var/log/mysqlebs.log')
         logformat = '%(asctime)s <%(process)d> %(levelname)s mysqlzfs:: %(message)s'
-
-        if not os.path.isdir(os.path.dirname(logfile)):
-            os.mkdir(os.path.dirname(logfile))
-
         logger = logging.getLogger('mysqlebs')
 
         loglevel = None
@@ -136,6 +131,9 @@ class MysqlZfs(object):
         if opts.log is None:
             logging.basicConfig(stream=None, level=loglevel, format=logformat)
         else:
+            logfile = os.path.join(opts.log)
+            if not os.path.isdir(os.path.dirname(logfile)):
+                os.mkdir(os.path.dirname(logfile))
             logging.basicConfig(filename=logfile, level=loglevel, format=logformat)
 
         return logger
