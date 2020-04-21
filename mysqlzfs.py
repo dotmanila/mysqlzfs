@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import boto3
 import gzip
@@ -15,13 +15,17 @@ import signal
 import struct
 import time
 import traceback
-from ConfigParser import ConfigParser, NoOptionError
+from configparser import ConfigParser, NoOptionError
 from botocore.exceptions import ClientError as BotoClientError
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from multiprocessing import Pool, TimeoutError, cpu_count
-from optparse import OptionParser
 from subprocess import Popen, PIPE, STDOUT, CalledProcessError
+from mysqlzfs import *
+from mysqlzfs import zfs
+from mysqlzfs import util as zfs_util
+from mysqlzfs.mysql import MySQLClient
+from mysql.connector.errors import Error as MySQLError
 
 # TODO items:
 # Binlog streaming support
@@ -43,406 +47,37 @@ from subprocess import Popen, PIPE, STDOUT, CalledProcessError
 # cleanup old lst_._* binlog files
 # binlog gap scanning and report, total count, size and date range
 
-MYSQLZFS_VERSION = 0.3
-MYSQLZFS_CMD_SNAP = 'snapshot'
-MYSQLZFS_CMD_EXPORT = 'export'
-MYSQLZFS_CMD_IMPORT = 'import'
-MYSQLZFS_CMD_DUMP = 'dump'
-MYSQLZFS_CMD_MYSQLD = 'mysqld'
-MYSQLZFS_CMD_CLONE = 'clone'
-MYSQLZFS_CMD_S3 = 's3'
-MYSQLZFS_CMD_BINLOGD = 'binlogd'
-
-MYSQLZFS_EXPTYPE_FULL = 'full'
-MYSQLZFS_EXPTYPE_INCR = 'incremental'
-MYSQLZFS_EXPTYPE_NONE = None
-
-MYSQLZFS_SIGTERM_CAUGHT = False
-MYSQLZFS_S3_CLIENT = None
-
 
 def __sigterm_handler(signal, frame):
     global MYSQLZFS_SIGTERM_CAUGHT
     print('Signal caught, terminating')
     MYSQLZFS_SIGTERM_CAUGHT = True
 
+
 def s3_client_initialize():
     global MYSQLZFS_S3_CLIENT
     MYSQLZFS_S3_CLIENT = boto3.client('s3')
 
+
 def s3_upload(job):
-    bucket, file, s3key = job
+    bucket, fname, s3key = job
     try:
         MYSQLZFS_S3_CLIENT.head_object(Bucket=bucket, Key=s3key)
 
-        if not os.path.isfile('%s.s3part' % file):
-            return (True, '%s (skipped, already exist)' % s3key)
-    except BotoClientError, err:
+        if not os.path.isfile('%s.s3part' % fname):
+            return True, '%s (skipped, already exist)' % s3key
+    except BotoClientError as err:
         pass
 
     try:
         ts_start = time.time()
-        open('%s.s3part' % file, 'a').close()
-        MYSQLZFS_S3_CLIENT.upload_file(file, bucket, s3key,
+        open('%s.s3part' % fname, 'a').close()
+        MYSQLZFS_S3_CLIENT.upload_file(fname, bucket, s3key,
                                        ExtraArgs={'StorageClass': 'STANDARD_IA'})
-        os.unlink('%s.s3part' % file)
-        return (True, '%s took %fs' % (s3key, round(time.time()-ts_start)))
-    except BotoClientError, err:
-        return (False, '%s %s' % (s3key, str(err)))
-
-
-class MysqlZfs(object):
-    @staticmethod
-    def buildopts():
-        opt_usage = "Usage: %prog [options] COMMAND"
-        opt_desc = "Managed ZFS snapshots for MySQL backups"
-        opt_epilog = ""
-        parser = MysqlZfsOptParser(opt_usage, version="%prog " + str(MYSQLZFS_VERSION),
-            description=opt_desc, epilog=opt_epilog)
-        parser.add_option('-z', '--dataset', dest='dataset', type='string',
-            help='ZFS root dataset to manage, default mysql/root')
-        parser.add_option('-o', '--backup-dir', dest='backupdir', type='string',
-            help='Root backups directory for binlogs, exports and dumps')
-        parser.add_option('-B', '--s3-bucket', dest='s3bucket', type='string',
-            help='S3 bucket for this node, NOT USED AT THIS TIME')
-        parser.add_option('-K', '--status', dest='status', action="store_true", 
-            help='For most commands, display existing snapshots/dumps/exports',
-            default=False)
-        parser.add_option('-s', '--snapshot', dest='snapshot', type='string',
-            help='Operate on this named snapshot i.e. for export/import')
-        parser.add_option('-d', '--debug', dest='debug', action="store_true", 
-            help='Enable debugging outputs',
-            default=False)
-        parser.add_option('-F', '--full', dest='full', action="store_true", 
-            help='Force a full export of most recent snapshot',
-            default=False)
-        parser.add_option('-I', '--incr', dest='incr', action="store_true", 
-            help='Force a incr export of most recent snapshot',
-            default=False)
-        parser.add_option('-c', '--defaults-file', dest='dotmycnf', type='string', 
-            help='Path to .my.cnf containing connection credentials to MySQL',
-            default='/root/.my.cnf')
-        parser.add_option('-r', '--skip-repl-check', dest='skipreplcheck', action="store_true", 
-            help='Wether to skip replication check when taking the snapshot',
-            default=False)
-        parser.add_option('-S', '--stage', dest='stage', action="store_true", 
-            help='When specified with import command, run MySQL service on imported dataset',
-            default=False)
-        parser.add_option('-k', '--stop', dest='stop', action="store_true", 
-            help='Stop the MySQL instance running on staged --snapshot',
-            default=False)
-        parser.add_option('-g', '--start', dest='start', action="store_true", 
-            help='Start the MySQL instance running on staged --snapshot',
-            default=False)
-        parser.add_option('-x', '--run', dest='run', action="store_true", 
-            help='Run the default actions for a command i.e. for s3 is upload',
-            default=False)
-        parser.add_option('-w', '--cleanup', dest='cleanup', action="store_true", 
-            help='Run the cleanup actions for a command i.e. for s3 is prune local and remote',
-            default=False)
-        parser.add_option('-t', '--threads', dest='threads', type='int',
-            help='How many threads for parallel jobs i.e. S3 uploads, mydumper')
-        parser.add_option('-m', '--metrics-text-dir', dest='metrics_text_dir', type='string', 
-            help='Emit textfile metrics to this directory for node_exporter',
-            default=None)
-
-
-        (opts, args) = parser.parse_args()
-
-        if os.getuid() != 0:
-            parser.error('This tool should only be run as root ... for now')
-
-        if opts.dataset is None:
-            parser.error('ZFS dataset to manage is required i.e. mysql/root.')
-        else:
-            zfsprop, zfserr = Zfs.get(opts.dataset, ['compression'])
-            if zfsprop is None or zfserr != '':
-                parser.error('ZFS dataset is unreadable (%s)' % zfserr)
-
-        if opts.backupdir is None:
-            parser.error('Backups directory is required')
-        elif not os.path.isdir(opts.backupdir):
-            parser.error('Backups directory does not exist')
-
-        if opts.metrics_text_dir is not None and not os.path.isdir(opts.metrics_text_dir):
-            parser.error('Specified metrics textfile directory does not exist')
-
-        opts.dataset = opts.dataset.strip('/')
-
-        try:
-            dset = opts.dataset.replace('/', '_')
-            cdir = os.path.join(opts.backupdir, dset)
-            if not os.path.isdir(cdir):
-                os.mkdir(cdir)
-
-            for bdir in ['dump', 'binlog', 'zfs']:
-                cdir = os.path.join(opts.backupdir, dset, bdir)
-                if not os.path.isdir(cdir):
-                    os.mkdir(cdir)
-        except Exception, err:
-            parser.error('Error creating %s' % cdir)
-
-        opts.bindir = os.path.join(opts.backupdir, dset, 'zfs')
-        opts.dumpdir = os.path.join(opts.backupdir, dset, 'dump')
-        opts.binlogdir = os.path.join(opts.backupdir, dset, 'binlog')
-
-        cmds = [MYSQLZFS_CMD_SNAP, MYSQLZFS_CMD_EXPORT, MYSQLZFS_CMD_IMPORT, 
-                MYSQLZFS_CMD_DUMP, MYSQLZFS_CMD_MYSQLD, MYSQLZFS_CMD_CLONE,
-                MYSQLZFS_CMD_S3, MYSQLZFS_CMD_BINLOGD]
-        if len(args) == 1 and args[0] not in cmds:
-            parser.error("Command not recognized, got '%s'. See more with --help" % args[0])
-        elif len(args) <= 0:
-            parser.error("Command not specified. See more with --help")
-        elif len(args) > 1:
-            parser.error("Multiple commands specified. See more with --help")
-        else:
-            opts.cmd = args[0]
-
-        if opts.snapshot is None and opts.cmd == MYSQLZFS_CMD_IMPORT:
-            parser.error('Snapshot name is required when importing, see --status')
-
-        if opts.cmd == MYSQLZFS_CMD_DUMP and Zfs.which('mydumper') is None:
-            parser.error('mydumper command/utility not found')
-        # We hardcode the s3 bucket name for now
-        #elif opts.cmd == MYSQLZFS_CMD_S3:
-        #    if opts.s3bucket is None:
-        #        parser.error('S3 bucket is required with this command')
-
-        opts.root = '%s@s' % opts.dataset
-        opts.fslist = ['%s/data@s' % opts.dataset, '%s/redo@s' % opts.dataset]
-        opts.ppid = os.getpid()
-        opts.pcwd = os.path.dirname(os.path.realpath(__file__))
-
-        if opts.threads is None:
-            cpus = cpu_count()
-            if cpus <= 2:
-                opts.threads = 1
-            elif cpus <= 8:
-                opts.threads = int(cpus/2)
-            else:
-                opts.threads = 8
-
-        return opts
-
-    @staticmethod
-    def create_logger(opts):
-        logger = None
-        logfile = os.path.join('/var/log', 
-                               'mysqlzfs-%s-%s.log' % (
-                                    opts.cmd.lower(), 
-                                    opts.dataset.strip().replace('/', '-')
-                                ))
-        logformat = '%(asctime)s <%(process)d> %(levelname)s mysqlzfs:: %(message)s'
-
-        if not os.path.isdir(os.path.dirname(logfile)):
-            os.mkdir(os.path.dirname(logfile))
-
-        loglevel = None
-        if opts.debug:
-            loglevel = logging.DEBUG
-        else:
-            loglevel = logging.INFO
-
-        logging.basicConfig(filename=logfile, level=loglevel, format=logformat)
-
-        logger = logging.getLogger('mysqlzfs')
-        
-        if sys.stdout.isatty():
-            log_stream = logging.StreamHandler(sys.stdout)
-            log_stream.setLevel(logger.getEffectiveLevel())
-            log_stream.setFormatter(logging.Formatter(fmt=logformat))
-            logger.addHandler(log_stream)
-
-        return logger
-
-    @staticmethod
-    def pidno_from_pstree(ppid, procname):
-        """ Traverses an output of pstree -p INT -A
-        and returns the pidno of the first matching process name
-
-        python(9934)-+-mydumper(10667)-+-{mydumper}(10669)
-                     |                 |-{mydumper}(10670)
-                     |                 |-{mydumper}(10672)
-                     |                 |-{mydumper}(10674)
-                     |                 |-{mydumper}(10676)
-                     |                 |-{mydumper}(10678)
-                     |                 |-{mydumper}(10680)
-                     |                 `-{mydumper}(10682)
-                     `-pstree(10668)
-        """
-        pidno = None
-        cmd_pstree = ['pstree', '-p', '-A', str(ppid)]
-
-        p = Popen(cmd_pstree, stdout=PIPE, stderr=PIPE)
-        out, err = p.communicate()
-        p = None
-        if err is not '':
-            return None, err
-
-        root_list = out.split('\n')
-        
-        for s in root_list:
-            if s == '':
-                continue
-
-            p = s.split('-')
-            if len(p) < 1:
-                continue
-
-            for n in p:
-                if procname not in n:
-                    continue
-
-                name, pid = n.strip(')').split('(')
-                if name.strip('}{') == procname:
-                    return int(pid), None
-
-        return None, ''
-
-    @staticmethod
-    def proc_status(pidno):
-        """ retrieves the data from /proc/PID/status and puts it in an
-        OrderedDict
-        """
-        status_file = '/proc/%d/status' % int(pidno)
-        if not os.path.isfile(status_file):
-            return None
-
-        status_list = OrderedDict()
-        with open(status_file) as statusfd:
-            for status_line in statusfd:
-                k, v = status_line.split(':')
-                status_list[k.strip()] = v.strip()
-        statusfd.close()
-
-        return status_list
-
-    @staticmethod
-    def tsftime(unixtime, format = '%m/%d/%Y %H:%M:%S'):
-        d = datetime.fromtimestamp(unixtime)
-        return d.strftime(format)
-
-    @staticmethod
-    def read_config_file(cfgfile):
-        if not os.path.isfile(cfgfile):
-            return None
-
-        cfg = ConfigParser(allow_no_value=True)
-        cfg.read(cfgfile)
-        return cfg
-
-    @staticmethod
-    def sizeof_fmt(num, suffix='B'):
-        for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
-            if abs(num) < 1024.0:
-                return "%3.1f%s%s" % (num, unit, suffix)
-            num /= 1024.0
-        return "%.1f%s%s" % (num, 'Yi', suffix)
-
-    @staticmethod
-    def write_lock_file(lockfile, pidno):
-        with open(lockfile, 'w') as lockfd:
-            lockfd.write(str(pidno))
-
-        lockfd.close()
-        return True
-
-    @staticmethod
-    def read_lock_file(lockfile):
-        """ Check if lock file exists and returns the pidno of the binlog 
-        process. If binlog process is dead, delete lock file and return None
-        """
-        pid = None
-        
-        if not os.path.isfile(lockfile):
-            return False, pid
-
-        with open(lockfile, 'r') as lockfd:
-            for pidline in lockfd:
-                try:
-                    pid = int(pidline)
-                    if pid <= 0:
-                        continue
-                    break
-                except ValueError, err:
-                    return False, pid
-                finally:
-                    lockfd.close()
-                    break
-
-        if pid is None or pid <= 0:
-            return False, pid
-
-        return MysqlZfs.is_process_running(pid), pid
-
-    @staticmethod
-    def is_process_running(pidno):
-        """ Check for /proc/PID/status
-        - If it exists, if not process is dead, return True
-        - If exists and process state is Z, return False
-        - 
-        TODO: Check also that that process is not in zombie?
-        """
-        if pidno is None:
-            return False
-
-        if MysqlZfs.proc_status(pidno) is not None:
-            return True
-        else:
-            return False
-
-    @staticmethod
-    def mysql_connect(dotmycnf, section='client'):
-
-        try:
-            cnf = MysqlZfs.read_config_file(dotmycnf)
-            if cnf is None:
-                raise Exception('Could not read provided %s' % dotmycnf)
-            elif not cnf.has_option(section, 'host'):
-                section = 'client'
-
-            if not cnf.has_option(section, 'host'):
-                raise Exception('.my.cnf %s group requires host option' % section)
-
-            params = { 'read_default_file': dotmycnf,
-                       'read_default_group': section }
-                       
-            conn = MySQLdb.connect(cnf.get(section, 'host'), **params)
-            # MySQLdb for some reason has autoccommit off by default
-            conn.autocommit(True)
-            return conn
-        except MySQLdb.Error, e:
-            raise Exception('Could not establish connection to MySQL server')
-
-    @staticmethod
-    def emit_text_metric(name, value, textdir):
-        if textdir is None:
-            return True
-
-        file = '%s/mysqlzfs.prom' % textdir
-        wrote = False
-        write = []
-
-        if not os.path.isfile(file):
-            write.append('%s %s' % (name, value))
-            wrote = True
-        else:
-            with open(file, 'r') as fd:
-                metrics = fd.readlines()
-                for metric in metrics:
-                    if '%s ' % name in metric:
-                        write.append('%s %s\n' % (name, value))
-                        wrote = True
-                    else:
-                        write.append('%s\n' % metric.rstrip())
-
-            if not wrote:
-                write.append('%s %s\n' % (name, value))
-
-        with open(file, 'w') as fd:
-            fd.writelines(write)
-
-        return True
+        os.unlink('%s.s3part' % fname)
+        return True, '%s took %fs' % (s3key, round(time.time()-ts_start))
+    except BotoClientError as err:
+        return False, '%s %s' % (s3key, str(err))
 
 
 class MysqlZfsSnapshotManager(object):
@@ -468,11 +103,11 @@ class MysqlZfsSnapshotManager(object):
         p = Popen(cmd_list, stdout=PIPE, stderr=PIPE)
         self.logger.debug(' '.join(cmd_list))
         out, err = p.communicate()
-        if err is not '':
-            self.logger.error(err)
-            return 0, err
+        if err.decode('ascii') is not '':
+            self.logger.error(err.decode('ascii'))
+            return 0, err.decode('ascii')
 
-        root_list = out.split('\n')
+        root_list = out.decode('ascii').split('\n')
         self.snaps = []
         for s in root_list:
             if self.opts.root not in s:
@@ -491,11 +126,11 @@ class MysqlZfsSnapshotManager(object):
     def zfs_dataset_info(self, full_snapname):
         p = Popen(['/sbin/zfs', 'list', '-H', '-p', full_snapname], stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
-        if err is not '':
-            self.logger.error(err)
+        if err.decode('ascii') is not '':
+            self.logger.error(err.decode('ascii'))
             return None
 
-        return out.split('\t')
+        return out.decode('ascii').split('\t')
         
     def snapshot_to_bin(self, snapname=None):
         full_names = []
@@ -542,7 +177,7 @@ class MysqlZfsSnapshotManager(object):
             return True
 
         if not execute_full_snapshot:
-            snapprop, snaperr = Zfs.get('%s@s%s' % (self.opts.dataset, last_snapname), ['origin'])
+            snapprop, snaperr = zfs.get('%s@s%s' % (self.opts.dataset, last_snapname), ['origin'])
             if snapprop is None:
                 self.logger.error('Looks like the source for incremental snapshot is missing')
                 self.logger.error(snaperr)
@@ -590,8 +225,8 @@ class MysqlZfsSnapshotManager(object):
             self.logger.debug('Export sets list %s' % str(self.bins))
             # delete only the oldes set when the newest one is full
             # this means if we want to keep two weeks/sets, we make it three here
-            self.logger.debug('Pruning export sets %s' % str(self.bins.keys()[:-3]))
-            purge_list = self.bins.keys()[:-3]
+            self.logger.debug('Pruning export sets %s' % str(list(self.bins.keys())[:-3]))
+            purge_list = list(self.bins.keys())[:-3]
             for folder in purge_list:
                 purge_folder = os.path.join(self.opts.bindir, folder)
                 self.logger.info('Pruning export set %s' % purge_folder)
@@ -643,7 +278,7 @@ class MysqlZfsSnapshotManager(object):
             self.logger.error('ZFS send command failed with code: %d' % r)
             return False
 
-        MysqlZfs.emit_text_metric(
+        zfs_util.emit_text_metric(
             'mysqlzfs_last_export{dataset="%s"}' % self.opts.dataset, 
             int(time.time()), self.opts.metrics_text_dir)
 
@@ -733,17 +368,17 @@ class MysqlZfsSnapshotManager(object):
         size_h = None
         for s in self.bins:
             self.logger.info('Binary export set: %s' % s)
-            size_h = MysqlZfs.sizeof_fmt(self.bins_dict[s][self.bins[s]['full']]['size'])
+            size_h = zfs_util.sizeof_fmt(self.bins_dict[s][self.bins[s]['full']]['size'])
             self.logger.info('+- full: %s %s' % (self.bins[s]['full'], size_h))
             for i in self.bins[s]['incr']:
-                size_h = MysqlZfs.sizeof_fmt(self.bins_dict[s][i]['size'])
+                size_h = zfs_util.sizeof_fmt(self.bins_dict[s][i]['size'])
                 self.logger.info('+--- incr: %s %s' % (i, size_h))
 
     def find_last_export(self):
         if self.bins is None:
             return MYSQLZFS_EXPTYPE_NONE, MYSQLZFS_EXPTYPE_NONE, MYSQLZFS_EXPTYPE_NONE
 
-        last_set = self.bins.keys()[-1]
+        last_set = list(self.bins.keys())[-1]
         if len(self.bins[last_set]['incr']) > 0:
             return MYSQLZFS_EXPTYPE_INCR, self.bins[last_set]['incr'][-1], last_set
         else:
@@ -849,8 +484,8 @@ class MysqlZfsSnapshotManager(object):
 
         p = Popen(args, stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
-        if err is not '':
-            self.logger.error(err)
+        if err.decode('ascii') is not '':
+            self.logger.error(err.decode('ascii'))
             return False
 
         return True
@@ -858,8 +493,8 @@ class MysqlZfsSnapshotManager(object):
     def zfs_create_dataset(self, dataset, properties={}):
         p = Popen(['/sbin/zfs', 'create', dataset], stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
-        if err is not '':
-            self.logger.error(err)
+        if err.decode('ascii') is not '':
+            self.logger.error(err.decode('ascii'))
             return False
 
         if len(properties) > 0:
@@ -867,8 +502,8 @@ class MysqlZfsSnapshotManager(object):
                 p = Popen(['/sbin/zfs', 'set', '%s=%s' % (k, properties[k]), dataset], 
                           stdout=PIPE, stderr=PIPE)
                 out, err = p.communicate()
-                if err is not '':
-                    self.logger.error(err)
+                if err.decode('ascii') is not '':
+                    self.logger.error(err.decode('ascii'))
                     self.zfs_destroy_dataset(dataset)
                     return False
 
@@ -884,7 +519,7 @@ class MysqlZfsSnapshotManager(object):
         # for now.
         root_target = '%s/s%s' % (self.opts.dataset, binname)
 
-        dsprop, zfserr = Zfs.get(root_target, ['origin'])
+        dsprop, zfserr = zfs.get(root_target, ['origin'])
         if dsprop is not None:
             self.logger.error('Target dataset %s already exists, cannot import' % root_target)
             return False
@@ -901,49 +536,37 @@ class MysqlZfsSnapshotManager(object):
         return True
 
     def zfs_snapshot(self):
-        conn = None
+        mysql_client = None
 
         try:
-            conn = MysqlZfs.mysql_connect(self.opts.dotmycnf, 'zfsmysql')
-            cur = conn.cursor(MySQLdb.cursors.DictCursor)
+            mysql_client = MySQLClient({'option_files': self.opts.dotmycnf})
 
-            if not self.opts.skipreplcheck:
-                cur.execute('SHOW SLAVE STATUS')
+            if not self.opts.skip_repl_check and not mysql_client.replication_status():
+                self.logger.error('Replication thread(s) are not running')
+                return False
 
-                while True:
-                    row = cur.fetchone()
-                    if row is None: 
-                        self.logger.error('MySQL server is not running as replica')
-                        return False
-
-                    break
-
-                if row['Slave_IO_Running'] != 'Yes' or row['Slave_SQL_Running'] != 'Yes':
-                    self.logger.error('Replication thread(s) are not running')
-                    return False
-
-            if self.opts.skipreplcheck:
+            if self.opts.skip_repl_check:
                 self.logger.debug('Locking tables for backup')
-                cur.execute('LOCK TABLES FOR BACKUP')
+                mysql_client.query('LOCK TABLES FOR BACKUP')
             else:
                 self.logger.debug('Stopping SQL thread')
-                cur.execute('STOP SLAVE SQL_THREAD')
+                mysql_client.stop_replication()
                 self.logger.debug('Flushing tables')
-                cur.execute('FLUSH TABLES')
+                mysql_client.query('FLUSH TABLES')
 
-            snapname = datetime.today().strftime('%Y%m%d%H%M%S')
+            snapshot_ts = datetime.today().strftime('%Y%m%d%H%M%S')
             self.logger.debug('Taking snapshot')
-            args = ['/sbin/zfs', 'snap', '-r', '%s@s%s' % (self.opts.dataset, snapname)]
+            args = ['/sbin/zfs', 'snap', '-r', '%s@s%s' % (self.opts.dataset, snapshot_ts)]
 
             p = Popen(args, stdout=PIPE, stderr=PIPE)
             out, err = p.communicate()
-            if err is not '':
-                self.logger.error(err)
+            if err.decode('ascii') is not '':
+                self.logger.error(err.decode('ascii'))
                 return False
 
-            self.logger.info('Snapshot %s@s%s complete' % (self.opts.dataset, snapname))
+            self.logger.info('Snapshot %s@s%s complete' % (self.opts.dataset, snapshot_ts))
 
-            MysqlZfs.emit_text_metric(
+            zfs_util.emit_text_metric(
                 'mysqlzfs_last_snapshot{dataset="%s"}' % self.opts.dataset, 
                 int(time.time()), self.opts.metrics_text_dir)
 
@@ -952,24 +575,19 @@ class MysqlZfsSnapshotManager(object):
                 self.logger.debug(' - %s@s%s' % (self.opts.dataset, s))
                 self.zfs_destroy_dataset('%s@s%s' % (self.opts.dataset, s))
 
-        except MySQLdb.Error, e:
+        except MySQLError as err:
             self.logger.error('A MySQL error has occurred, aborting new snapshot')
-            self.logger.error(str(e))
+            self.logger.error(str(err.decode('ascii')))
             return False
         finally:
-            if conn is not None:
-                if cur is None:
-                    cur = conn.cursor(MySQLdb.cursors.DictCursor)
-
-                if self.opts.skipreplcheck:
+            if mysql_client is not None:
+                if self.opts.skip_repl_check:
                     self.logger.debug('Unlocking tables')
-                    cur.execute('UNLOCK TABLES')
+                    mysql_client.query('UNLOCK TABLES')
                 else:
                     self.logger.debug('Resuming replication')
-                    cur.execute('START SLAVE')
-
-                cur.close()
-                conn.close()
+                    mysql_client.start_replication()
+                mysql_client.close()
 
     def zfs_snapshot_summary(self):
         if len(self.snaps) <= 0:
@@ -984,7 +602,7 @@ class MysqlZfsSnapshotManager(object):
         root_snapname = '%s@s%s' % (self.opts.dataset, self.opts.snapshot)
         root_target = '%s/s%s' % (self.opts.dataset, self.opts.snapshot)
 
-        dsprop, zfserr = Zfs.get(root_target, ['origin'])
+        dsprop, zfserr = zfs.get(root_target, ['origin'])
         if dsprop is not None:
             self.logger.error('Target dataset %s already exists, cannot clone' % root_target)
             return False
@@ -1020,8 +638,8 @@ class MysqlZfsSnapshotManager(object):
     def zfs_clone_snapshot(self, snapshot, target):
         p = Popen(['/sbin/zfs', 'clone', snapshot, target], stdout=PIPE, stderr=PIPE)
         out, err = p.communicate()
-        if err is not '':
-            self.logger.error(err)
+        if err.decode('ascii') is not '':
+            self.logger.error(err.decode('ascii'))
             return False
 
         return True
@@ -1039,12 +657,12 @@ class MysqlDumper(object):
         self.zfsmgr = zfsmgr
 
         self.lockfile = '/tmp/mysqlzfs-dump-%s.lock' % (re.sub('/', '_', self.opts.dataset))
-        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
+        self.is_running, self.pid = zfs_util.read_lock_file(self.lockfile)
 
         if self.is_running:
             raise Exception('Another dump process is running with PID %d' % self.pid)
 
-        MysqlZfs.write_lock_file(self.lockfile, self.opts.ppid)
+        zfs_util.write_lock_file(self.lockfile, self.opts.ppid)
 
     def start(self):
         mysqlds = MysqlZfsServiceList(self.logger, self.opts, self.zfsmgr)
@@ -1083,9 +701,9 @@ class MysqlDumper(object):
         r = p_dumper.poll()
         poll_count = 0
 
-        dumperpid, piderr = MysqlZfs.pidno_from_pstree(self.opts.ppid, 'mydumper')
+        dumperpid, piderr = zfs_util.pidno_from_pstree(self.opts.ppid, 'mydumper')
         self.logger.debug('mydumper pid %s' % str(dumperpid))
-        #print(MysqlZfs.proc_status(dumperpid))
+        #print(zfs_util.proc_status(dumperpid))
 
         while r is None:
             time.sleep(2)
@@ -1096,8 +714,8 @@ class MysqlDumper(object):
                 if poll_count > 2:
                     out, err = p_dumper.communicate()
                     r = p_dumper.returncode
-                    if err != '':
-                        self.logger.error(err)
+                    if err.decode('ascii') != '':
+                        self.logger.error(err.decode('ascii'))
                     break
 
                 continue
@@ -1121,7 +739,7 @@ class MysqlDumper(object):
 
         self.logger.info('mydumper process completed')
 
-        MysqlZfs.emit_text_metric(
+        zfs_util.emit_text_metric(
             'mysqlzfs_last_dump{dataset="%s"}' % self.opts.dataset, 
             int(time.time()), self.opts.metrics_text_dir)
 
@@ -1364,7 +982,7 @@ class MysqlZfsService(object):
                                    self.cnf['mysqld']['log-error'])
 
         if pid_no is None:
-            pid_no, piderr = MysqlZfs.pidno_from_pstree(self.opts.ppid, 'mysqld')
+            pid_no, piderr = zfs_util.pidno_from_pstree(self.opts.ppid, 'mysqld')
 
             if pid_no is not None:
                 self.logger.info('Using PID from from pstree %d' % int(pid_no))
@@ -1385,7 +1003,7 @@ class MysqlZfsService(object):
                 r = p_mysqld.wait()
                 break
 
-            proc_status = MysqlZfs.proc_status(pid_no)
+            proc_status = zfs_util.proc_status(pid_no)
             if proc_status is not None and 'Z' not in proc_status['State']:
                 continue
 
@@ -1430,12 +1048,12 @@ class MysqlZfsService(object):
             try:
                 cur = conn.cursor(MySQLdb.cursors.DictCursor)
                 cur.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.PROCESSLIST")
-            except MySQLdb.Error, e:
+            except MySQLdb.Error as e:
                 self.logger.error('MySQL is running but could not execute query')
                 return None
 
             return True
-        except MySQLdb.Error, e:
+        except MySQLdb.Error as e:
             return False
         finally:
             if conn is not None:
@@ -1633,7 +1251,7 @@ class MysqlBinlogStreamer(object):
         WRITE_ROWS_EVENT_V2: 'WriteRowsEvent',
         DELETE_ROWS_EVENT_V2: 'DeleteRowsEvent',
         TABLE_MAP_EVENT: 'TableMapEvent',
-        #5.6 GTID enabled replication events
+        # 5.6 GTID enabled replication events
         ANONYMOUS_GTID_LOG_EVENT: 'NotImplementedEvent',
         PREVIOUS_GTIDS_LOG_EVENT: 'NotImplementedEvent'
     }
@@ -1646,7 +1264,6 @@ class MysqlBinlogStreamer(object):
         WRITE_ROWS_EVENT_V2,
         DELETE_ROWS_EVENT_V2
     ]
-
 
     def __init__(self, logger, opts):
         self.logger = logger
@@ -1665,23 +1282,23 @@ class MysqlBinlogStreamer(object):
         self.ses_binlog_lst_file = os.path.join(self.opts.binlogdir, self.ses_binlog_lst_prefix)
         self.ses_binlog_lst_bin = None
         self.ses_binlog_tmp_prefix = 'tmp_._%s_._%s' % (self.srv_hostname, self.srv_binlog_prefix)
-        #self.cur = self.conn.cursor(MySQLdb.cursors.DictCursor)
+        # self.cur = self.conn.cursor(MySQLdb.cursors.DictCursor)
         self.binlogdir = os.path.join(self.opts.binlogdir, self.srv_hostname)
         if not os.path.isdir(self.binlogdir):
             os.mkdir(self.binlogdir)
 
-        self.binzip = Zfs.which('pigz')
+        self.binzip = zfs_util.which('pigz')
         if self.binzip is None:
             self.logger.info('pigz is not available, consider installing '
                              'for faster compressions')
-            self.binzip = Zfs.which('gzip')
+            self.binzip = zfs_util.which('gzip')
             if self.binzip is None:
                 self.logger.info('gzip is not available, consider installing '
                                  'pigz for faster compressions')
 
     def srv_connect_ctl(self):
         try:
-            self.cnf = MysqlZfs.read_config_file(self.opts.dotmycnf)
+            self.cnf = zfs_util.read_config_file(self.opts.dotmycnf)
             if self.cnf is None:
                 raise Exception('mysqlbinlog section is not available from .my.cnf')
             elif not self.cnf.has_option('mysqlbinlog', 'host'):
@@ -1693,7 +1310,7 @@ class MysqlBinlogStreamer(object):
             self.conn = MySQLdb.connect(self.cnf.get('mysqlbinlog', 'host'), **params)
             # MySQLdb for some reason has autoccommit off by default
             self.conn.autocommit(True)
-        except MySQLdb.Error, e:
+        except MySQLdb.Error as e:
             raise Exception('Could not establish connection to MySQL server')
 
     def srv_cursor_fetchone(self, sql):
@@ -1704,11 +1321,11 @@ class MysqlBinlogStreamer(object):
         return cur.fetchone()
 
     def start(self):
-        mysqlbinlog = Zfs.which('mysqlbinlog')
+        mysqlbinlog = zfs_util.which('mysqlbinlog')
         if mysqlbinlog is None:
             raise Exception('mysqlbinlog command not found')
 
-        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
+        self.is_running, self.pid = zfs_util.read_lock_file(self.lockfile)
         if self.is_running:
             self.logger.error('mysqlbinlog process still running with PID %s' % self.pid)
             return False
@@ -1721,13 +1338,13 @@ class MysqlBinlogStreamer(object):
         self.ses_binlog_next = self.find_next_binlog()
 
         # Adding compress seems to be buggy on mysqlbinlog
-        binlogd_cmd = [mysqlbinlog, 
-                    "--defaults-file=%s" % self.opts.dotmycnf, 
-                    "--read-from-remote-master=BINLOG-DUMP-GTIDS",  
-                    "--stop-never-slave-server-id=%s" % str(int(time.time())), 
-                    "--raw", "--stop-never", "--result-file=%s_._%s_._" % (
-                        'tmp', self.srv_hostname),
-                    self.ses_binlog_next]
+        binlogd_cmd = [mysqlbinlog,
+                       "--defaults-file=%s" % self.opts.dotmycnf,
+                       "--read-from-remote-master=BINLOG-DUMP-GTIDS",
+                       "--stop-never-slave-server-id=%s" % str(int(time.time())),
+                       "--raw", "--stop-never", "--result-file=%s_._%s_._" % (
+                           'tmp', self.srv_hostname),
+                       self.ses_binlog_next]
 
         self.logger.info(' '.join(binlogd_cmd))
 
@@ -1752,7 +1369,7 @@ class MysqlBinlogStreamer(object):
                 self.logger.error('Timed out waiting for mysqlbinlog pid')
                 return False
 
-            MysqlZfs.write_lock_file(self.lockfile, self.pid)
+            zfs_util.write_lock_file(self.lockfile, self.pid)
 
             while time.time() < end_ts:
                 # Cleanup every minute
@@ -1774,7 +1391,7 @@ class MysqlBinlogStreamer(object):
                 p.kill()
             elif r != 0:
                 self.logger.error("mysqlbinlog exited error code %s" % str(r))
-                MysqlZfs.emit_text_metric(
+                zfs_util.emit_text_metric(
                     'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
                     int(time.time()), self.opts.metrics_text_dir)
 
@@ -1782,9 +1399,9 @@ class MysqlBinlogStreamer(object):
                 FNULL.close()
 
             os.chdir(opts.pcwd)
-        except Exception, e:
+        except Exception as e:
             self.logger.error("mysqlbinlog died with error %s" % str(e))
-            MysqlZfs.emit_text_metric(
+            zfs_util.emit_text_metric(
                 'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
                 int(time.time()), self.opts.metrics_text_dir)
             raise
@@ -1792,7 +1409,7 @@ class MysqlBinlogStreamer(object):
         self.logger.info('Starting session post-cleanup')
         self.session_cleanup()
 
-        MysqlZfs.emit_text_metric(
+        zfs_util.emit_text_metric(
             'mysqlzfs_last_binlogd_ok{dataset="%s"}' % self.opts.dataset, 
             int(time.time()), self.opts.metrics_text_dir)
 
@@ -1801,7 +1418,7 @@ class MysqlBinlogStreamer(object):
     def wait_for_pid(self):
         sleeps = 10
         while sleeps > 0:
-            pidno, err = MysqlZfs.pidno_from_pstree(self.opts.ppid, 'mysqlbinlog')
+            pidno, err = zfs_util.pidno_from_pstree(self.opts.ppid, 'mysqlbinlog')
             if pidno is not None:
                 return pidno
 
@@ -1816,6 +1433,11 @@ class MysqlBinlogStreamer(object):
         of each session, we clean them up to help identify where we start.
         """
         self.logger.debug('Starting session cleanup')
+        self.session_cleanup_tmp(keep_last)
+        self.session_cleanup_lst()
+        self.logger.debug('Session cleanup complete')
+
+    def session_cleanup_tmp(self, keep_last = False):
         binlogs = self.find_session_binlogs()
         if len(binlogs) == 0:
             return True
@@ -1856,12 +1478,66 @@ class MysqlBinlogStreamer(object):
 
                 self.logger.debug('Found %s, moving to %s' % (fn, fndest))
                 if not self.zip(fnpath, fndest_zip):
-                    self.logger.error('Compression failed for %s' % fnpath)
                     if os.path.isfile(fndest_zip):
                         os.unlink(fndest_zip)
-                    return False
 
-        self.logger.debug('Session cleanup complete')
+                    zfs_util.emit_text_metric(
+                        'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
+                        int(time.time()), self.opts.metrics_text_dir)
+
+                    raise Exception('Compression failed for %s' % fnpath)
+
+        return True
+
+    def session_cleanup_lst(self):
+        binlogs = self.find_session_binlogs(self.ses_binlog_lst_prefix)
+        if len(binlogs) == 0:
+            return True
+
+        next_binlog = self.find_next_binlog()
+
+        for fn in binlogs:
+            fnpath = os.path.join(self.opts.binlogdir, fn)
+            fnparts = fn.split('_._')
+            fn_created_ts = self.binlog_ts_created(fnpath)
+            fndir = os.path.join(self.binlogdir, fn_created_ts[:8])
+            fndest = os.path.join(fndir, '%s_._%s' % (str(fn_created_ts), fnparts[2]))
+            fndest_zip = '%s.gz' % fndest
+            fndest_part_zip = '%s.part.gz' % fndest
+
+            if os.path.isfile(fndest_zip):
+                self.logger.debug('Removing stale %s' % fnpath)
+                os.unlink(fnpath)
+                continue
+            else:
+                skip = '%s.%s' % (self.ses_binlog_lst_prefix, next_binlog[-6:])
+                
+                if skip == fn:
+                    self.logger.debug('%s is last tmp binlog, skipping partial save' % skip)
+                    continue
+
+                self.logger.info('Full binlog %s is missing' % fndest)
+                self.logger.info('Filling with partial %s' % fnpath)
+
+                if not os.path.isdir(fndir):
+                    os.mkdir(fndir)
+
+                if os.path.isfile(fndest_part_zip):
+                    self.logger.warn('%s exists, skipping' % fndest_part_zip)
+                    self.logger.warn('Please check this binlog manually')
+                    continue
+
+                if not self.zip(fnpath, fndest_part_zip):
+                    if os.path.isfile(fndest_zip):
+                        os.unlink(fndest_zip)
+
+                    zfs_util.emit_text_metric(
+                        'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset, 
+                        int(time.time()), self.opts.metrics_text_dir)
+
+                    raise Exception('Compression failed for %s' % fnpath)
+
+        return True
 
     def find_next_binlog(self):
         """ Identify the next binlog to download
@@ -1948,7 +1624,7 @@ class MysqlBinlogStreamer(object):
         row = None
         try:
             row = self.srv_cursor_fetchone(sql)
-        except MySQLdb.Error, err:
+        except MySQLdb.Error as err:
             if err.args[0] == 2006:
                 self.srv_connect_ctl()
                 row = self.srv_cursor_fetchone(sql)
@@ -1963,7 +1639,10 @@ class MysqlBinlogStreamer(object):
         self.logger.debug('Binlog exists on server [%s]' % str(row))
         return True        
 
-    def find_session_binlogs(self):
+    def find_session_binlogs(self, prefix=None):
+        if prefix is None:
+            prefix = self.ses_binlog_tmp_prefix
+
         binlogs = []
         lsout = os.listdir(self.opts.binlogdir)
         if len(lsout) == 0:
@@ -1975,7 +1654,7 @@ class MysqlBinlogStreamer(object):
             if os.path.isdir(fnpath):
                 continue
 
-            if re.search('^%s' % self.ses_binlog_tmp_prefix, fn) is not None \
+            if re.search('^%s' % prefix, fn) is not None \
                     and self.is_binlog_format(fnpath):
                 binlogs.append(fn)
 
@@ -2053,7 +1732,7 @@ class MysqlBinlogStreamer(object):
             os.unlink(binlog)
 
             return True
-        except Exception, err:
+        except Exception as err:
             self.logger.error(str(err))
             return False
 
@@ -2128,7 +1807,7 @@ class MysqlZfsServiceList(object):
             if not os.path.isdir(rootdir) or not re.search('^s[0-9]{14}$', d):
                 continue
 
-            props, err = Zfs.get(rootdir.strip('/'), ['origin'])
+            props, err = zfs.get(rootdir.strip('/'), ['origin'])
             if err is not '':
                 self.logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
                 self.logger.error(err)
@@ -2163,7 +1842,7 @@ class MysqlZfsServiceList(object):
         if not os.path.isdir(rootdir):
             return None
 
-        props, err = Zfs.get(rootdir.strip('/'), ['origin'])
+        props, err = zfs.get(rootdir.strip('/'), ['origin'])
         if err is not '':
             self.logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
             self.logger.error('Returned "%s"' % err)
@@ -2194,16 +1873,16 @@ class MysqlS3Client(object):
         self.ts_end = None
         self.ignorelist = ['metadata', 'metadata.partial', 's3metadata', 's3metadata.partial']
         self.lockfile = '/tmp/mysqlzfs-s3-%s.lock' % (re.sub('/', '_', self.opts.dataset))
-        self.is_running, self.pid = MysqlZfs.read_lock_file(self.lockfile)
+        self.is_running, self.pid = zfs_util.read_lock_file(self.lockfile)
 
         if self.is_running:
             raise Exception('Another S3 upload process is running with PID %d' % self.pid)
 
-        MysqlZfs.write_lock_file(self.lockfile, self.opts.ppid)
+        zfs_util.write_lock_file(self.lockfile, self.opts.ppid)
 
         try:
             self.s3.head_bucket(Bucket=self.bucket)
-        except BotoClientError, err:
+        except BotoClientError as err:
             if int(err.response['Error']['Code']) == 404:
                 self.logger.info('Bucket %s does not exist, creating' % self.bucket)
                 self.s3.create_bucket(ACL='private', Bucket=self.bucket)
@@ -2212,7 +1891,7 @@ class MysqlS3Client(object):
                 self.logger.error(str(err))
 
     def reap_children(self, timeout=3):
-        "Tries hard to terminate and ultimately kill all the children of this process."
+        """ Tries hard to terminate and ultimately kill all the children of this process. """
         def on_terminate(proc):
             print("process {} terminated with exit code {}".format(proc, proc.returncode))
 
@@ -2221,7 +1900,7 @@ class MysqlS3Client(object):
         for p in procs:
             try:
                 p.terminate()
-            except psutil.NoSuchProcess:
+            except psutil.NoSuchProcess as err:
                 pass
         gone, alive = psutil.wait_procs(procs, timeout=timeout, callback=on_terminate)
         if alive:
@@ -2230,7 +1909,7 @@ class MysqlS3Client(object):
                 print("process {} survived SIGTERM; trying SIGKILL".format(p))
                 try:
                     p.kill()
-                except psutil.NoSuchProcess:
+                except psutil.NoSuchProcess as err:
                     pass
             gone, alive = psutil.wait_procs(alive, timeout=timeout, callback=on_terminate)
             if alive:
@@ -2272,7 +1951,7 @@ class MysqlS3Client(object):
                     self.logger.info(message)
                 else:
                     self.logger.debug(message)
-        except TimeoutError, err:
+        except TimeoutError as err:
             pass
 
     def upload_dumps(self):
@@ -2358,9 +2037,9 @@ class MysqlS3Client(object):
             chunks += 32
             
             if chunks >= objects:
-                print ' '
+                print(' ')
             else:
-                print chunks,
+                print(chunks,)
 
         self.ts_end = time.time()
         self.write_metadata(source_dir)
@@ -2452,7 +2131,7 @@ class MysqlS3Client(object):
             binlogs = self.scandir_binlogs(host, day)
 
             self.logger.info('Uploading %d objects from %s/%s' % (len(binlogs), host, day))
-            #print(binlogs)
+            # print(binlogs)
             self.upload_chunks(binlogs)
 
             s3bucket, s3file, s3key = binlogs[0]
@@ -2515,9 +2194,9 @@ class MysqlS3Client(object):
 
         if self.ts_end is not None:
             with open(meta_file, 'w') as metafd:
-                metafd.write('dt_start:%s\n' % MysqlZfs.tsftime(self.ts_start, '%Y_%m_%d-%H_%M_%S'))
+                metafd.write('dt_start:%s\n' % zfs_util.tsftime(self.ts_start, '%Y_%m_%d-%H_%M_%S'))
                 metafd.write('ts_start:%s\n' % self.ts_start)
-                metafd.write('dt_end:%s\n' % MysqlZfs.tsftime(self.ts_end, '%Y_%m_%d-%H_%M_%S'))
+                metafd.write('dt_end:%s\n' % zfs_util.tsftime(self.ts_end, '%Y_%m_%d-%H_%M_%S'))
                 metafd.write('ts_end:%s\n' % self.ts_end)
             metafd.close()
 
@@ -2525,7 +2204,7 @@ class MysqlS3Client(object):
                 os.unlink(meta_file_partial)
         else:
             with open(meta_file_partial, 'w') as metafd:
-                metafd.write('dt_start:%s\n' % MysqlZfs.tsftime(self.ts_start, '%Y_%m_%d-%H_%M_%S'))
+                metafd.write('dt_start:%s\n' % zfs_util.tsftime(self.ts_start, '%Y_%m_%d-%H_%M_%S'))
                 metafd.write('ts_start:%s\n' % self.ts_start)
             metafd.close()
 
@@ -2548,52 +2227,6 @@ class MysqlS3Client(object):
         return True
 
 
-class Zfs(object):
-    @staticmethod
-    def get(dataset, properties=[]):
-        cmd_get = ['/sbin/zfs', 'get', '-H', '-p']
-        if len(properties) == 0:
-            cmd_get.append('all')
-        else:
-            cmd_get.append(','.join(properties))
-        cmd_get.append(dataset)
-
-        p = Popen(cmd_get, stdout=PIPE, stderr=PIPE)
-        #print(str(cmd_get))
-        out, err = p.communicate()
-        if err is not '':
-            #print('x"%s"-' % err)
-            return None, err
-
-        root_list = out.split('\n')
-        
-        prop_list = OrderedDict()
-        for s in root_list:
-            if s == '':
-                continue
-
-            p = s.split('\t')
-            prop_list[p[1]] = p[2]
-
-        return prop_list, ''
-
-    @staticmethod
-    def which(file):
-        for path in os.environ["PATH"].split(os.pathsep):
-            filepath = os.path.join(path, file)
-            if os.path.exists(filepath):
-                    return filepath
-
-        return None
-
-
-# http://stackoverflow.com/questions/1857346/\
-# python-optparse-how-to-include-additional-info-in-usage-output
-class MysqlZfsOptParser(OptionParser):
-    def format_epilog(self, formatter):
-        return self.epilog
-
-
 if __name__ == "__main__":
     try:
         signal.signal(signal.SIGTERM, __sigterm_handler)
@@ -2602,8 +2235,8 @@ if __name__ == "__main__":
         logger = None
         opts = None
 
-        opts = MysqlZfs.buildopts()
-        logger = MysqlZfs.create_logger(opts)
+        opts = zfs_util.buildopts()
+        logger = zfs_util.create_logger(opts)
         zfsmgr = MysqlZfsSnapshotManager(logger, opts)
 
         if opts.cmd == MYSQLZFS_CMD_EXPORT:
@@ -2670,7 +2303,7 @@ if __name__ == "__main__":
 
         logger.info('Done')
 
-    except Exception, e:
+    except Exception as e:
         if logger is not None:
             if opts is None or (opts is not None and opts.debug):
                 tb = traceback.format_exc().splitlines()

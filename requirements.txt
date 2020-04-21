@@ -1,0 +1,10 @@
+awscli==1.18.41
+boto3==1.12.41
+psutil>=5.7.0
+requests>=2.23.0
+mysqlclient>=1.4.6
+botocore
+mysql-connector-python>=8.0.19
+pytest>=5.4.1
+pytest-cov>=2.8.1
+codecov>=2.0.22
