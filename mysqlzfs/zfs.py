@@ -50,3 +50,24 @@ def get(dataset, properties=[]):
         prop_list[p[1]] = p[2]
 
     return prop_list, ''
+
+
+class Zfs(object):
+    """ ZFS dataset object """
+    def __init__(self, dataset):
+        pass
+
+    def get(self, dataset, properties=[]):
+        return get(dataset, properties)
+
+    def clone(self):
+        pass
+
+    def snapshot(self):
+        pass
+
+    def create(self):
+        pass
+
+    def destroy(self):
+        pass

@@ -14,6 +14,8 @@ def s3_upload(bucket, file_name, key):
     try:
         s3.head_object(Bucket=bucket, Key=key)
 
+        # Only return True when s3part does not exist
+        # otherwise re-upload to be sure.
         if not os.path.isfile('%s.s3part' % file_name):
             return True
     except ClientError as err:

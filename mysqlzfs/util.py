@@ -6,12 +6,13 @@ import os
 import sys
 from . import *
 from . import zfs
-from . import util as zfs_util
+from .constants import *
 from collections import OrderedDict
 from configparser import ConfigParser, NoOptionError
 from datetime import datetime, timedelta
 from multiprocessing import cpu_count
 from optparse import OptionParser
+from subprocess import Popen, PIPE, STDOUT, CalledProcessError
 
 
 def which(file_name):
@@ -127,7 +128,7 @@ def buildopts():
     if opts.snapshot is None and opts.cmd == MYSQLZFS_CMD_IMPORT:
         parser.error('Snapshot name is required when importing, see --status')
 
-    if opts.cmd == MYSQLZFS_CMD_DUMP and zfs_util.which('mydumper') is None:
+    if opts.cmd == MYSQLZFS_CMD_DUMP and which('mydumper') is None:
         parser.error('mydumper command/utility not found')
     # We hardcode the s3 bucket name for now
     # elif opts.cmd == MYSQLZFS_CMD_S3:

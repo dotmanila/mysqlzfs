@@ -44,14 +44,20 @@ class MySQLClient(object):
         return results[0]
 
     def start_replication(self, sql_thread=False, io_thread=False):
-        sql = 'START SLAVE'
-        if sql_thread:
-            sql = "%s SQL_THREAD" % sql
-        elif io_thread:
-            sql = "%s IO_THREAD" % sql
+        try:
+            sql = 'START SLAVE'
+            if sql_thread:
+                sql = "%s SQL_THREAD" % sql
+            elif io_thread:
+                sql = "%s IO_THREAD" % sql
 
-        self.query(sql)
-        return self.replication_status(sql_thread=sql_thread, io_thread=io_thread)
+            self.query(sql)
+            return self.replication_status(sql_thread=sql_thread, io_thread=io_thread)
+        except mysql.connector.errors.DatabaseError as err:
+            # 1200 (HY000): The server is not configured as slave
+            if err.args[0] == 1200:
+                return True
+            raise
 
     def stop_replication(self, sql_thread=False, io_thread=False):
         sql = 'STOP SLAVE'
@@ -65,6 +71,9 @@ class MySQLClient(object):
 
     def replication_status(self, sql_thread=False, io_thread=False):
         status = self.show_slave_status()
+        if status is None:
+            return False
+
         sql_running = True if status['Slave_SQL_Running'] == 'Yes' else False
         io_running = True if status['Slave_IO_Running'] == 'Yes' else False
 
