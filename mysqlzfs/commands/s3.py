@@ -2,27 +2,61 @@
 
 import boto3
 import botocore.exceptions
+import logging
 import psutil
 import os
 import signal
+import socket
 import sys
 import re
 import time
 from .. import util as zfs_util
 from .. import aws
 from ..constants import *
-from .dump import MysqlDumper
+from .dump import is_dump_complete
 from collections import OrderedDict
 from multiprocessing import Pool, TimeoutError
 
+_global_s3_client_ = None
+logger = logging.getLogger(__name__)
+
+
+def s3_initialize_global_client():
+    global _global_s3_client_
+    _global_s3_client_ = boto3.client('s3')
+
+
+def s3_upload_file(job):
+    bucket, file_name, key = job
+    part_file = '%s.s3part' % file_name
+    ts_start = time.time()
+
+    try:
+        _global_s3_client_.head_object(Bucket=bucket, Key=key)
+
+        # Only return True when s3part does not exist
+        # otherwise re-upload to be sure.
+        if not os.path.isfile(part_file):
+            return True
+    except botocore.exceptions.ClientError as err:
+        pass
+
+    try:
+        open(part_file, 'a').close()
+        _global_s3_client_.upload_file(file_name, bucket, key,
+                                       ExtraArgs={'StorageClass': 'STANDARD_IA'})
+        os.unlink(part_file)
+        return True, '%s took %fs' % (key, round(time.time()-ts_start))
+    except botocore.exceptions.ClientError as err:
+        return False, '%s %s' % (key, str(err))
+
 
 class MysqlS3Client(object):
-    def __init__(self, logger, opts):
+    def __init__(self, opts):
         self.sigterm_caught = False
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
         self.opts = opts
-        self.logger = logger
         self.bucket = 'mysqlzfs-us-east-1'
         self.s3 = boto3.client('s3')
         self.ts_start = time.time()
@@ -40,14 +74,14 @@ class MysqlS3Client(object):
             self.s3.head_bucket(Bucket=self.bucket)
         except botocore.exceptions.ClientError as err:
             if int(err.response['Error']['Code']) == 404:
-                self.logger.info('Bucket %s does not exist, creating' % self.bucket)
+                logger.info('Bucket %s does not exist, creating' % self.bucket)
                 self.s3.create_bucket(ACL='private', Bucket=self.bucket)
             else:
-                self.logger.debug(err.response)
-                self.logger.error('S3 Client Error %s' % str(err))
+                logger.debug(err.response)
+                logger.error('S3 Client Error %s' % str(err))
                 sys.exit(1)
         except botocore.exceptions.NoCredentialsError as err:
-            self.logger.error('S3 Client Error %s' % str(err))
+            logger.error('S3 Client Error %s' % str(err))
             sys.exit(1)
 
     def _signal_handler(self, signal, frame):
@@ -80,36 +114,28 @@ class MysqlS3Client(object):
                 for p in alive:
                     print("process {} survived SIGKILL; giving up".format(p))
 
-    def upload_file(self, job):
-        bucket, fname, s3key = job
-        ts_start = time.time()
-        open('%s.s3part' % fname, 'a').close()
-        uploaded = aws.s3_upload(bucket, fname, s3key)
-        if not uploaded:
-            return False, '%s %s' % (s3key, str(err))
-
-        os.unlink('%s.s3part' % fname)
-        return True, '%s took %fs' % (s3key, round(time.time()-ts_start))
-
     def upload_chunks(self, s3list):
-        s3pool = Pool(self.opts.threads)
-        results = s3pool.map_async(s3_upload, s3list)
+        # This to avoid pickling failure due to boto3 session being global
+        # we had to make sure our client is also global and initiated once
+        # _pickle.PicklingError: Can't pickle <class 'botocore.client.S3'>
+        s3pool = Pool(self.opts.threads, s3_initialize_global_client)
+        results = s3pool.map_async(s3_upload_file, s3list)
 
         while not results.ready():
-            if MYSQLZFS_SIGTERM_CAUGHT:
+            if self.sigterm_caught:
                 self.reap_children()
-                self.logger.info('Cleaned up children processes')
+                logger.info('Cleaned up children processes')
                 psutil.Process(self.opts.ppid).kill()
-                self.logger.info('Closing S3 upload pool')
+                logger.info('Closing S3 upload pool')
                 # Nothing gets executed beyond this point
 
                 s3pool.close()
                 s3pool.terminate()
                 s3pool.join()
-                self.logger.info('Terminated S3 upload pool')
+                logger.info('Terminated S3 upload pool')
                 break
 
-            self.logger.debug('Waiting for results')
+            logger.debug('Waiting for results')
             time.sleep(5)
 
         s3pool.close()
@@ -120,9 +146,9 @@ class MysqlS3Client(object):
             for result in results:
                 success, message = result
                 if not success:
-                    self.logger.info(message)
+                    logger.info(message)
                 else:
-                    self.logger.debug(message)
+                    logger.debug(message)
         except TimeoutError as err:
             pass
 
@@ -132,12 +158,12 @@ class MysqlS3Client(object):
 
         if self.opts.snapshot is not None:
             source_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
-            if not MysqlDumper.is_dump_complete(source_dir):
-                self.logger.error('%s is not valid dump directory' % source_dir)
+            if not is_dump_complete(source_dir):
+                logger.error('%s is not valid dump directory' % source_dir)
                 return False
 
             if self.is_upload_complete(source_dir):
-                self.logger.info('%s upload is already complete, exiting' % source_dir)
+                logger.info('%s upload is already complete, exiting' % source_dir)
                 return True
 
             snapshot = self.opts.snapshot
@@ -149,18 +175,18 @@ class MysqlS3Client(object):
                 snapshot = dumpdir
                 source_dir = os.path.join(self.opts.dumpdir, dumpdir)
 
-                if MysqlDumper.is_dump_complete(source_dir):
+                if is_dump_complete(source_dir):
                     if not self.is_upload_complete(source_dir):
                         break
 
-                    self.logger.info('%s upload is already complete, skipping' % source_dir)
+                    logger.info('%s upload is already complete, skipping' % source_dir)
                     source_dir = None
                 else:
-                    self.logger.warn('%s is an incomplete dump, skipping' % source_dir)
+                    logger.warn('%s is an incomplete dump, skipping' % source_dir)
                     source_dir = None
 
         if source_dir is None:
-            self.logger.info('No valid dump directory found to upload')
+            logger.info('No valid dump directory found to upload')
             return True
 
         dumpfiles = os.listdir(source_dir)
@@ -189,7 +215,7 @@ class MysqlS3Client(object):
             # only need to resume from there
             if re.search('\.s3(last|part)$', dumpfile):
                 if not partially_uploaded:
-                    self.logger.info('Resuming a previously failed upload')
+                    logger.info('Resuming a previously failed upload')
                     s3list = []
                     partially_uploaded = True
                     # We do this because the actual file precedes the current
@@ -200,18 +226,14 @@ class MysqlS3Client(object):
             s3list.append((self.bucket, upload_file, upload_key, ))
 
         objects = len(s3list)
-        self.logger.info('Uploading %d objects' % objects)
+        logger.info('Uploading %d objects' % objects)
         # We upload in batches of 32 per pool to get nearer feedback
         chunks = 0
-        s3list = [s3list[i:i + 32] for i in xrange(0, objects, 32)]
+        s3list = [s3list[i:i + 32] for i in range(0, objects, 32)]
         for chunk in s3list:
             self.upload_chunks(chunk)
             chunks += 32
-
-            if chunks >= objects:
-                print(' ')
-            else:
-                print(chunks,)
+            logger.info('Progress %d/%d uploaded' % (chunks, objects))
 
         self.ts_end = time.time()
         self.write_metadata(source_dir)
@@ -246,7 +268,7 @@ class MysqlS3Client(object):
             binlogdir = os.path.join(self.opts.binlogdir, host, daydir)
 
             if self.is_upload_complete(binlogdir):
-                self.logger.debug('%s upload is already complete, skipping' % binlogdir)
+                logger.debug('%s upload is already complete, skipping' % binlogdir)
                 continue
 
             if not os.path.isdir(binlogdir):
@@ -254,7 +276,7 @@ class MysqlS3Client(object):
 
             # daydir should be datetime format
             if not re.search('^20\d{6}$', daydir):
-                self.logger.debug('%s does not match, skipping' % binlogdir)
+                logger.debug('%s does not match, skipping' % binlogdir)
                 continue
 
             binlogdays.append(daydir)
@@ -263,7 +285,7 @@ class MysqlS3Client(object):
 
     def scandir_binlogs(self, host, day):
         binlogdir = os.path.join(self.opts.binlogdir, host, day)
-        self.logger.debug('Scanning %s' % binlogdir)
+        logger.debug('Scanning %s' % binlogdir)
         lsout = os.listdir(binlogdir)
         lsout.sort()
         partially_uploaded = False
@@ -289,12 +311,12 @@ class MysqlS3Client(object):
         return binlogs
 
     def upload_binlogs_host(self, host):
-        self.logger.info('Scanning for binlog from %s' % host)
+        logger.info('Scanning for binlog from %s' % host)
         binlogdays = self.scandir_binlog_days(host)
         s3last = None
 
         if len(binlogdays) == 0:
-            self.logger.info('No binlog directories to upload from %s' % host)
+            logger.info('No binlog directories to upload from %s' % host)
             return True
 
         s3list = OrderedDict()
@@ -302,7 +324,7 @@ class MysqlS3Client(object):
             binlogdir = os.path.join(self.opts.binlogdir, host, day)
             binlogs = self.scandir_binlogs(host, day)
 
-            self.logger.info('Uploading %d objects from %s/%s' % (len(binlogs), host, day))
+            logger.info('Uploading %d objects from %s/%s' % (len(binlogs), host, day))
             # print(binlogs)
             self.upload_chunks(binlogs)
 
@@ -327,7 +349,7 @@ class MysqlS3Client(object):
     def upload_binlogs(self):
         hostdirs = self.scandir_binlog_hosts()
         if len(hostdirs) == 0:
-            self.logger.error('No binlog directories to upload at this time')
+            logger.error('No binlog directories to upload at this time')
             return False
 
         for host in hostdirs:

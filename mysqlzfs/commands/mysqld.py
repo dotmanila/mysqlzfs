@@ -3,6 +3,7 @@
 import MySQLdb
 import os
 import signal
+import time
 from .. import util as zfs_util
 from collections import OrderedDict
 from subprocess import Popen, PIPE
@@ -36,22 +37,22 @@ class MysqlZfsService(object):
                 'socket':os.path.join(self.datadir, 'mysqld%s.sock' % self.snapshot)
             }),
             'mysqld': OrderedDict({
-                'pid-file':os.path.join(self.datadir, 'mysqld%s.pid' % self.snapshot),
-                'socket':os.path.join(self.datadir, 'mysqld%s.sock' % self.snapshot),
-                'sql_mode':'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION',
-                'datadir':self.datadir,
-                'innodb_log_group_home_dir':os.path.join(self.rootdir, 'redo'),
-                'innodb_doublewrite':0,
-                'innodb_checksum_algorithm':'none',
-                'innodb_log_file_size':'1G',
-                'innodb_buffer_pool_size':'1G',
-                'innodb_flush_log_at_trx_commit':2,
-                'port':30066,
-                'user':'mysql',
-                'skip-slave-start':None,
-                'skip-networking':None,
-                'skip-name-resolve':None,
-                'log-error':os.path.join(self.datadir, 'error%s.log' % self.snapshot)
+                'pid-file': os.path.join(self.datadir, 'mysqld%s.pid' % self.snapshot),
+                'socket': os.path.join(self.datadir, 'mysqld%s.sock' % self.snapshot),
+                'sql_mode': 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION',
+                'datadir': self.datadir,
+                'innodb_log_group_home_dir': os.path.join(self.rootdir, 'redo'),
+                'innodb_doublewrite': 0,
+                'innodb_checksum_algorithm': 'none',
+                'innodb_log_file_size': '1G',
+                'innodb_buffer_pool_size': '1G',
+                'innodb_flush_log_at_trx_commit': 2,
+                'port': 30066,
+                'user': 'mysql',
+                'skip-slave-start': None,
+                'skip-networking': None,
+                'skip-name-resolve': None,
+                'log-error': os.path.join(self.datadir, 'error%s.log' % self.snapshot)
             })
         })
 
@@ -185,7 +186,6 @@ class MysqlZfsService(object):
         if os.path.isfile(self.cnf_auto):
             os.unlink(self.cnf_auto)
 
-
         mysqld = ['/usr/sbin/mysqld', '--defaults-file=%s' % self.cnf_file,
                   '--user=%s' % self.cnf['mysqld']['user'], '--daemonize']
         self.logger.debug('Starting mysqld with %s' % ' '.join(mysqld))
@@ -257,6 +257,7 @@ class MysqlZfsService(object):
         this object.
         """
         conn = None
+        cur = None
         params = dict()
 
         params['read_default_file'] = self.opts.dotmycnf
@@ -266,7 +267,7 @@ class MysqlZfsService(object):
 
         try:
             conn = MySQLdb.connect('localhost', **params)
-            # MySQLdb for some reason has autoccommit off by default
+            # MySQLdb for some reason has autocommit off by default
             conn.autocommit(True)
             try:
                 cur = conn.cursor(MySQLdb.cursors.DictCursor)
@@ -283,21 +284,20 @@ class MysqlZfsService(object):
                 cur.close()
                 conn.close()
 
-    def get_pid_no(self, pidfile):
+    def get_pid_no(self, pid_file):
         pid_no = 0
-        with open(self.cnf['mysqld']['pid-file']) as pidfd:
-            pid_no = int(pidfd.read())
-        pidfd.close()
+        with open(pid_file) as pid_fd:
+            pid_no = int(pid_fd.read())
+        pid_fd.close()
 
         return pid_no
 
-    def get_proc_io(self, pidno):
+    def get_proc_io(self, pid_number):
         iostat = OrderedDict()
-        with open('/proc/%d/io' % pidno) as iofd:
-            for stat in iofd:
+        with open('/proc/%d/io' % pid_number) as io_fd:
+            for stat in io_fd:
                 kv = stat.split(':')
                 iostat[kv[0].strip()] = int(kv[1])
-        iofd.close()
 
         return iostat
 

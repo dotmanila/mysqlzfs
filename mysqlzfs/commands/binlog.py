@@ -153,7 +153,7 @@ class MysqlBinlogStreamer(object):
                 if r is not None:
                     break
 
-                if MYSQLZFS_SIGTERM_CAUGHT:
+                if self.sigterm_caught:
                     self.logger.info('Cleaning up mysqlbinlog process')
                     break
 

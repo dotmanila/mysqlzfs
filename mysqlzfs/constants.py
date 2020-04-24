@@ -1,6 +1,6 @@
 #!/bin/env python3
 
-MYSQLZFS_VERSION = 0.3
+MYSQLZFS_VERSION = '0.4.1'
 MYSQLZFS_CMD_SNAP = 'snapshot'
 MYSQLZFS_CMD_EXPORT = 'export'
 MYSQLZFS_CMD_IMPORT = 'import'
@@ -14,8 +14,12 @@ MYSQLZFS_EXPTYPE_FULL = 'full'
 MYSQLZFS_EXPTYPE_INCR = 'incremental'
 MYSQLZFS_EXPTYPE_NONE = None
 
-MYSQLZFS_SIGTERM_CAUGHT = False
 MYSQLZFS_S3_CLIENT = None
+
+VERSION_EQUAL = 0
+VERSION_LESS = -1
+VERSION_HIGH = 1
+VERSION_INVALID = 2
 
 """ Copied from pymysqlreplication.constants.BINLOG.py, we do not need to import
 it here

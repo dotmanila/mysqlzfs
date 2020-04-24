@@ -1,8 +1,10 @@
 #!/bin/env python3
 
+import logging
 import os
 import re
 import signal
+import time
 from .. import util as zfs_util
 from ..commands.mysqld import MysqlZfsService
 from ..commands.mysqld_group import MysqlZfsServiceList
@@ -10,13 +12,55 @@ from ..constants import *
 from collections import OrderedDict
 from subprocess import Popen, PIPE
 
+logger = logging.getLogger(__name__)
+
+
+def is_dump_complete(dump_dir):
+    """ Actually, if metadata file exists the dump is deemed complete
+    while it is in progress the file is called metadata.partial
+    """
+    meta_file = os.path.join(dump_dir, 'metadata')
+    if not os.path.isfile(meta_file):
+        return False
+
+    with open(meta_file) as meta_file_fd:
+        for meta in meta_file_fd:
+            if 'Finished dump at' in meta:
+                return True
+
+    return False
+
+
+def mydumper_version():
+    mydumper = zfs_util.which('mydumper')
+    if mydumper is None:
+        return None
+
+    try:
+        process = Popen([mydumper, '--version'], stdout=PIPE, stderr=PIPE)
+        out, err = process.communicate()
+        version_string = out.decode('ascii').split(' ')[1].split(',')[0]
+        high_or_equal = zfs_util.compare_versions(version_string, '0.9.5')
+
+        return VERSION_EQUAL or VERSION_HIGH
+    except ValueError as err:
+        return None
+    except TypeError as err:
+        return None
+    except IndexError as err:
+        return None
+
+
 class MysqlDumper(object):
-    def __init__(self, opts, logger, zfsmgr):
+    def __init__(self, opts, zfsmgr):
         self.sigterm_caught = False
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
+
+        if not mydumper_version():
+            raise Exception('mydumper minimum version should be 0.9.5')
+
         self.opts = opts
-        self.logger = logger
         self.mysqld = None
         self.zfsmgr = zfsmgr
 
@@ -32,7 +76,7 @@ class MysqlDumper(object):
         self.sigterm_caught = True
 
     def start(self):
-        mysqlds = MysqlZfsServiceList(self.logger, self.opts, self.zfsmgr)
+        mysqlds = MysqlZfsServiceList(logger, self.opts, self.zfsmgr)
         if self.opts.snapshot is None:
             self.opts.snapshot = self.zfsmgr.snaps[-1]
 
@@ -44,13 +88,12 @@ class MysqlDumper(object):
         elif not sandbox:
             raise Exception('Error checking cloned snapshot')
 
-        mysqld = MysqlZfsService(self.logger, self.opts)
+        mysqld = MysqlZfsService(logger, self.opts)
         if not mysqld.is_alive() and not mysqld.start():
             raise Exception('Could not start source instance')
 
-        self.logger.info('My own PID %d' % self.opts.ppid)
-
-        self.logger.info('Starting mydumper service on %s' % mysqld.rootdir)
+        logger.info('My own PID %d' % self.opts.ppid)
+        logger.info('Starting mydumper service on %s' % mysqld.rootdir)
 
         dump_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
         meta_file = os.path.join(dump_dir, 'metadata')
@@ -62,14 +105,14 @@ class MysqlDumper(object):
                   '--socket', mysqld.cnf['mysqld']['socket'],
                   '--defaults-file', self.opts.dotmycnf,
                   '--logfile', dump_log]
-        self.logger.debug('Running mydumper with %s' % ' '.join(dumper))
+        logger.debug('Running mydumper with %s' % ' '.join(dumper))
 
         p_dumper = Popen(dumper, stdout=PIPE, stderr=PIPE)
         r = p_dumper.poll()
         poll_count = 0
 
         dumperpid, piderr = zfs_util.pidno_from_pstree(self.opts.ppid, 'mydumper')
-        self.logger.debug('mydumper pid %s' % str(dumperpid))
+        logger.debug('mydumper pid %s' % str(dumperpid))
         # print(zfs_util.proc_status(dumperpid))
 
         while r is None:
@@ -82,29 +125,23 @@ class MysqlDumper(object):
                     out, err = p_dumper.communicate()
                     r = p_dumper.returncode
                     if err.decode('ascii') != '':
-                        self.logger.error(err.decode('ascii'))
+                        logger.error(err.decode('ascii'))
                     break
 
                 continue
-            elif os.path.isfile(meta_file):
-                with open(meta_file) as meta_file_fd:
-                    for meta in meta_file_fd:
-                        if 'Finished dump at' in meta:
-                            r = p_dumper.wait()
-                            meta_file_fd.close()
-                            break
-
-                meta_file_fd.close()
+            elif is_dump_complete(dump_dir):
+                r = p_dumper.wait()
+                break
 
         mysqld.stop()
         self.zfsmgr.destroy_clone(self.opts.snapshot)
 
         if r != 0:
-            self.logger.error('mydumper process returned with bad code: %d' % r)
-            self.logger.error('Check error log at %s' % dump_log)
+            logger.error('mydumper process returned with bad code: %d' % r)
+            logger.error('Check error log at %s' % dump_log)
             return False
 
-        self.logger.info('mydumper process completed')
+        logger.info('mydumper process completed')
 
         zfs_util.emit_text_metric(
             'mysqlzfs_last_dump{dataset="%s"}' % self.opts.dataset,
@@ -136,24 +173,10 @@ class MysqlDumper(object):
                 dumps[d]['s3'] = 'Not Started'
 
         if len(dumps) == 0:
-            self.logger.info('No stored logical dumps found')
+            logger.info('No stored logical dumps found')
 
         for d in dumps:
-            self.logger.info('Dump set %s' % d)
-            self.logger.info('+-- Status: %s' % dumps[d]['status'])
-            self.logger.info('+-- S3: %s' % dumps[d]['s3'])
-
-    @staticmethod
-    def is_dump_complete(dumpdir):
-        """ Actually, if metadata file exists the dump is deemed complete
-        while it is in progress the file is called metadata.partial
-        """
-        meta_file = os.path.join(dumpdir, 'metadata')
-        if os.path.isfile(meta_file):
-            with open(meta_file) as meta_file_fd:
-                for meta in meta_file_fd:
-                    if 'Finished dump at' in meta:
-                        return True
-
-        return False
+            logger.info('Dump set %s' % d)
+            logger.info('+-- Status: %s' % dumps[d]['status'])
+            logger.info('+-- S3: %s' % dumps[d]['s3'])
 

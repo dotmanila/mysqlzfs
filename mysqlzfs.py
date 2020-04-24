@@ -20,7 +20,6 @@ from mysqlzfs.constants import *
 # Auto replication service after import
 # How can we make sure exported snapshots are usable?
 # Handling disk space issues.
-# Check to make sure mydumper version is at leas 0.9.5
 # Pruning from S3 bucket
 # When binlog server source changes, binlog number changes too
 #   need a way to handle this more gracefully
@@ -44,7 +43,7 @@ if __name__ == "__main__":
     try:
         opts = zfs_util.buildopts()
         logger = zfs_util.create_logger(opts)
-        zfsmgr = MysqlZfsSnapshotManager(logger, opts)
+        zfsmgr = MysqlZfsSnapshotManager(opts)
 
         if opts.cmd == MYSQLZFS_CMD_EXPORT:
             if opts.run:
@@ -69,7 +68,7 @@ if __name__ == "__main__":
                 mysqld = MysqlZfsService(logger, opts)
                 mysqld.start()
         elif opts.cmd == MYSQLZFS_CMD_DUMP:
-            dumper = MysqlDumper(opts, logger, zfsmgr)
+            dumper = MysqlDumper(opts, zfsmgr)
             if opts.run:
                 dumper.start()
             else:
@@ -93,7 +92,7 @@ if __name__ == "__main__":
             else:
                 zfsmgr.zfs_snapshot_summary()
         elif opts.cmd == MYSQLZFS_CMD_S3:
-            s3 = MysqlS3Client(logger, opts)
+            s3 = MysqlS3Client(opts)
             if opts.run:
                 s3.upload_dumps()
                 s3.upload_binlogs()

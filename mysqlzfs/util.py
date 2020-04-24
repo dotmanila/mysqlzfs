@@ -24,6 +24,38 @@ def which(file_name):
     return None
 
 
+def compare_versions(version_string1, version_string2):
+    try:
+        version1 = version_string1.split('.')
+        version2 = version_string2.split('.')
+        if len(version1) != len(version2) or len(version1) != 3 or len(version2) != 3:
+            return VERSION_INVALID
+
+        v1_major, v1_minor, v1_point = version_string1.split('.')
+        v2_major, v2_minor, v2_point = version_string2.split('.')
+
+        if int(v1_major) < int(v2_major):
+            return VERSION_LESS
+        elif int(v1_major) > int(v2_major):
+            return VERSION_HIGH
+        elif int(v1_minor) < int(v2_minor):
+            return VERSION_LESS
+        elif int(v1_minor) > int(v2_minor):
+            return VERSION_HIGH
+        elif int(v1_point) < int(v2_point):
+            return VERSION_LESS
+        elif int(v1_point) > int(v2_point):
+            return VERSION_HIGH
+
+        return VERSION_EQUAL
+    except ValueError as err:
+        return None
+    except TypeError as err:
+        return None
+    except IndexError as err:
+        return None
+
+
 def buildopts():
     opt_usage = "Usage: %prog [options] COMMAND"
     opt_desc = "Managed ZFS snapshots for MySQL backups"
