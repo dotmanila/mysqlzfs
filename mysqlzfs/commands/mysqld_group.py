@@ -1,5 +1,6 @@
 #!/bin/env python3
 
+import logging
 import os
 import re
 import signal
@@ -7,66 +8,70 @@ from .. import zfs
 from .mysqld import MysqlZfsService
 from collections import OrderedDict
 
+logger = logging.getLogger(__name__)
+
 
 class MysqlZfsServiceList(object):
     """
     Manage a group of MysqlZfsService
     """
 
-    def __init__(self, logger, opts, zfsmgr):
+    def __init__(self, opts):
         self.sigterm_caught = False
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
-        self.logger = logger
         self.opts = opts
         self.rootdir = '/%s' % self.opts.dataset
-        self.zfsmgr = zfsmgr
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
+        logger.info('Signal caught, cleaning up')
 
     def cleanup(self):
         sandboxes = self.scan_sandboxes()
         if sandboxes is None:
-            self.logger.info('No sandboxes running on any stage datasets')
+            logger.info('No sandboxes running on any stage datasets')
             return None
 
         for s in sandboxes:
             if self.opts.snapshot and self.opts.snapshot != s:
                 continue
 
-            mysqld = MysqlZfsService(self.logger, self.opts, s)
-            self.logger.info('+- %s' % sandboxes[s]['rootdir'])
+            mysqld = MysqlZfsService(self.opts, s)
+            logger.info('+- %s' % sandboxes[s]['rootdir'])
             if mysqld.is_alive():
-                self.logger.info('+--- MySQL is running, shutting down')
+                logger.info('+--- MySQL is running, shutting down')
                 mysqld.stop()
 
-            self.logger.info('+--- Cleaning up ZFS dataset %s' % mysqld.dataset)
-            if self.zfsmgr.zfs_destroy_dataset(mysqld.dataset, recursive=True):
-                self.logger.info('+--- Done')
+            logger.info('+--- Cleaning up ZFS dataset %s' % mysqld.dataset)
+            success, error = zfs.destroy(mysqld.dataset, recursive=True)
+            if success:
+                logger.info('+--- Done')
+            else:
+                logger.error('+-- Unable to delete ZFS clone %s' % mysqld.dataset)
 
     def show_sandboxes(self):
         sandboxes = self.scan_sandboxes()
         if sandboxes is None:
-            self.logger.info('No sandboxes running on any stage datasets')
+            logger.info('No sandboxes running on any stage datasets')
             return None
 
         for s in sandboxes:
-            mysqld = MysqlZfsService(self.logger, self.opts, s)
-            self.logger.info('+- %s' % sandboxes[s]['rootdir'])
-            self.logger.info('+--- mysql --defaults-file=%s --socket=%s' % (
+            mysqld = MysqlZfsService(self.opts, s)
+            logger.info('+- %s' % sandboxes[s]['rootdir'])
+            logger.info('+--- mysql --defaults-file=%s --socket=%s' % (
                              self.opts.dotmycnf, sandboxes[s]['socket']))
             if mysqld.is_alive():
-                self.logger.info('+--- Running: Yes')
+                logger.info('+--- Running: Yes')
             else:
-                self.logger.info('+--- Running: No')
+                logger.info('+--- Running: No')
 
             if sandboxes[s]['deployed']:
-                self.logger.info('+--- MySQL deployed: Yes')
+                logger.info('+--- MySQL deployed: Yes')
             else:
-                self.logger.info('+--- MySQL deployed: No')
+                logger.info('+--- MySQL deployed: No')
 
-            self.logger.info('+--- Origin: %s' % sandboxes[s]['origin'])
+            logger.info('+--- Origin: %s' % sandboxes[s]['origin'])
 
     def scan_sandboxes(self):
         l = os.listdir(self.rootdir)
@@ -83,8 +88,8 @@ class MysqlZfsServiceList(object):
 
             props, err = zfs.get(rootdir.strip('/'), ['origin'])
             if err is not '':
-                self.logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
-                self.logger.error(err)
+                logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
+                logger.error(err)
                 continue
 
             snapname = re.sub('^s', '', d)
@@ -118,8 +123,8 @@ class MysqlZfsServiceList(object):
 
         props, err = zfs.get(rootdir.strip('/'), ['origin'])
         if err is not '':
-            self.logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
-            self.logger.error('Returned "%s"' % err)
+            logger.error('Unable to retrieve dataset property for %s' % rootdir.strip('/'))
+            logger.error('Returned "%s"' % err)
             return False
 
         sandbox = OrderedDict({

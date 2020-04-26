@@ -1,6 +1,6 @@
 #!/bin/env python3
 
-import MySQLdb
+import logging
 import os
 import re
 import shutil
@@ -10,9 +10,33 @@ import time
 import traceback
 from .. import util as zfs_util
 from ..constants import *
+from ..mysql import MySQLClient
 from ..packet import ___write_events, __event_map
 from datetime import datetime
-from subprocess import Popen
+from mysql.connector.errors import Error as MySQLError
+from subprocess import Popen, PIPE
+
+logger = logging.getLogger(__name__)
+
+
+def mysqlbinlog_version():
+    mysqlbinlog = zfs_util.which('mysqlbinlog')
+    if mysqlbinlog is None:
+        return None
+
+    try:
+        process = Popen([mysqlbinlog, '--version'], stdout=PIPE, stderr=PIPE)
+        out, err = process.communicate()
+        version_string = out.decode('ascii').split(' ')[1].split(',')[0]
+        high_or_equal = zfs_util.compare_versions(version_string, '3.4')
+
+        return VERSION_EQUAL or VERSION_HIGH
+    except ValueError as err:
+        return None
+    except TypeError as err:
+        return None
+    except IndexError as err:
+        return None
 
 
 class MysqlBinlogStreamer(object):
@@ -32,12 +56,13 @@ class MysqlBinlogStreamer(object):
     The timestamp on the binlog filename is the rotation timestamp of that binlog
     """
 
-    def __init__(self, logger, opts):
+    def __init__(self, opts):
         self.sigterm_caught = False
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
-        self.logger = logger
+        self.mysql_client = None
         self.opts = opts
+        self.is_running = False
         self.lockfile = os.path.join(self.opts.binlogdir, 'mysqlbinlog.lock')
         self.pid = None
         self.srv_hostname = None
@@ -52,101 +77,96 @@ class MysqlBinlogStreamer(object):
         self.ses_binlog_lst_file = os.path.join(self.opts.binlogdir, self.ses_binlog_lst_prefix)
         self.ses_binlog_lst_bin = None
         self.ses_binlog_tmp_prefix = 'tmp_._%s_._%s' % (self.srv_hostname, self.srv_binlog_prefix)
-        # self.cur = self.conn.cursor(MySQLdb.cursors.DictCursor)
         self.binlogdir = os.path.join(self.opts.binlogdir, self.srv_hostname)
         if not os.path.isdir(self.binlogdir):
             os.mkdir(self.binlogdir)
 
         self.binzip = zfs_util.which('pigz')
         if self.binzip is None:
-            self.logger.info('pigz is not available, consider installing '
+            logger.info('pigz is not available, consider installing '
                              'for faster compressions')
             self.binzip = zfs_util.which('gzip')
             if self.binzip is None:
-                self.logger.info('gzip is not available, consider installing '
+                logger.info('gzip is not available, consider installing '
                                  'pigz for faster compressions')
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
+        logger.info('Signal caught, cleaning up')
 
     def srv_connect_ctl(self):
         try:
-            self.cnf = zfs_util.read_config_file(self.opts.dotmycnf)
-            if self.cnf is None:
+            logger.debug('Establishing control connection to MySQL with %s' % self.opts.dotmycnf)
+            defaults_file = zfs_util.read_config_file(self.opts.dotmycnf)
+            if defaults_file is None:
                 raise Exception('mysqlbinlog section is not available from .my.cnf')
-            elif not self.cnf.has_option('mysqlbinlog', 'host'):
+            elif not defaults_file.has_option('mysqlbinlog', 'host'):
                 raise Exception('mysqlbinlog section requires at least host value')
 
-            params = { 'read_default_file': self.opts.dotmycnf,
-                       'read_default_group': 'mysqlbinlog' }
+            params = {'option_files': self.opts.dotmycnf,
+                      'option_groups': 'mysqlbinlog'}
 
-            self.conn = MySQLdb.connect(self.cnf.get('mysqlbinlog', 'host'), **params)
-            # MySQLdb for some reason has autoccommit off by default
-            self.conn.autocommit(True)
-        except MySQLdb.Error as e:
+            self.mysql_client = MySQLClient(params=params)
+        except MySQLError as err:
             raise Exception('Could not establish connection to MySQL server')
-
-    def srv_cursor_fetchone(self, sql):
-        """ This should not be called directly, see binlog_exists_ON_server
-        """
-        cur = self.conn.cursor(MySQLdb.cursors.DictCursor)
-        cur.execute(sql)
-        return cur.fetchone()
 
     def start(self):
         mysqlbinlog = zfs_util.which('mysqlbinlog')
         if mysqlbinlog is None:
             raise Exception('mysqlbinlog command not found')
 
+        if not mysqlbinlog_version():
+            raise Exception('Required mysqlbinlog version should be 3.4 or higher')
+
         self.is_running, self.pid = zfs_util.read_lock_file(self.lockfile)
         if self.is_running:
-            self.logger.error('mysqlbinlog process still running with PID %s' % self.pid)
+            logger.error('mysqlbinlog process still running with PID %s' % self.pid)
             return False
         else:
             self.pid = None
 
-        self.logger.info('Starting session pre-cleanup')
+        logger.info('Starting session pre-cleanup')
         self.session_cleanup()
 
         self.ses_binlog_next = self.find_next_binlog()
 
         # Adding compress seems to be buggy on mysqlbinlog
-        binlogd_cmd = [mysqlbinlog,
-                       "--defaults-file=%s" % self.opts.dotmycnf,
-                       "--read-from-remote-master=BINLOG-DUMP-GTIDS",
-                       "--stop-never-slave-server-id=%s" % str(int(time.time())),
-                       "--raw", "--stop-never", "--result-file=%s_._%s_._" % (
-                           'tmp', self.srv_hostname),
-                       self.ses_binlog_next]
+        mysqlbinlog_command = [mysqlbinlog,
+                               "--defaults-file=%s" % self.opts.dotmycnf,
+                               "--read-from-remote-master=BINLOG-DUMP-GTIDS",
+                               "--stop-never-slave-server-id=%s" % str(int(time.time())),
+                               "--raw", "--stop-never", "--result-file=%s_._%s_._" % (
+                                   'tmp', self.srv_hostname),
+                               self.ses_binlog_next]
 
-        self.logger.info(' '.join(binlogd_cmd))
+        logger.info(' '.join(mysqlbinlog_command))
 
         try:
             os.chdir(self.opts.binlogdir)
             end_ts = time.time() + 3585.0
             cleanup_int = 0
 
-            FNULL = None
+            dev_null = None
             if self.opts.debug:
-                p = Popen(binlogd_cmd)
+                p = Popen(mysqlbinlog_command)
             else:
-                FNULL = open(os.devnull, 'w')
-                p = Popen(binlogd_cmd, stdout=FNULL, stderr=FNULL)
+                dev_null = open(os.devnull, 'w')
+                p = Popen(mysqlbinlog_command, stdout=dev_null, stderr=dev_null)
 
             r = p.poll()
 
             self.pid = self.wait_for_pid()
-            self.logger.debug('mysqlbinlog PID %s' % str(self.pid))
+            logger.debug('mysqlbinlog PID %s' % str(self.pid))
 
             if self.pid is None:
-                self.logger.error('Timed out waiting for mysqlbinlog pid')
+                logger.error('Timed out waiting for mysqlbinlog pid')
                 return False
 
             zfs_util.write_lock_file(self.lockfile, self.pid)
 
             while time.time() < end_ts:
                 # Cleanup every minute
-                if cleanup_int%60 == 0:
+                if cleanup_int % 60 == 0:
                     self.session_cleanup(True)
 
                 r = p.poll()
@@ -154,7 +174,7 @@ class MysqlBinlogStreamer(object):
                     break
 
                 if self.sigterm_caught:
-                    self.logger.info('Cleaning up mysqlbinlog process')
+                    logger.info('Cleaning up mysqlbinlog process')
                     break
 
                 time.sleep(10)
@@ -163,23 +183,23 @@ class MysqlBinlogStreamer(object):
             if r is None:
                 p.kill()
             elif r != 0:
-                self.logger.error("mysqlbinlog exited error code %s" % str(r))
+                logger.error("mysqlbinlog exited error code %s" % str(r))
                 zfs_util.emit_text_metric(
                     'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset,
                     int(time.time()), self.opts.metrics_text_dir)
 
-            if FNULL is not None:
-                FNULL.close()
+            if dev_null is not None:
+                dev_null.close()
 
-            os.chdir(opts.pcwd)
-        except Exception as e:
-            self.logger.error("mysqlbinlog died with error %s" % str(e))
+            os.chdir(self.opts.pcwd)
+        except Exception as err:
+            logger.error("mysqlbinlog died with error %s" % str(err))
             zfs_util.emit_text_metric(
                 'mysqlzfs_last_binlogd_error{dataset="%s"}' % self.opts.dataset,
                 int(time.time()), self.opts.metrics_text_dir)
             raise
 
-        self.logger.info('Starting session post-cleanup')
+        logger.info('Starting session post-cleanup')
         self.session_cleanup()
 
         zfs_util.emit_text_metric(
@@ -205,10 +225,10 @@ class MysqlBinlogStreamer(object):
         into tmp_<hostname>_<binlogname> into the binlogdir directory. At the end or beginning
         of each session, we clean them up to help identify where we start.
         """
-        self.logger.debug('Starting session cleanup')
+        logger.debug('Starting session cleanup')
         self.session_cleanup_tmp(keep_last)
         self.session_cleanup_lst()
-        self.logger.debug('Session cleanup complete')
+        logger.debug('Session cleanup complete')
 
     def session_cleanup_tmp(self, keep_last = False):
         binlogs = self.find_session_binlogs()
@@ -226,7 +246,7 @@ class MysqlBinlogStreamer(object):
             fndest = os.path.join(fndir, '%s_._%s' % (str(fn_created_ts), fnparts[2]))
 
             if os.path.isfile(fndest):
-                self.logger.error('Destination binlog exists, saving as duplicate')
+                logger.error('Destination binlog exists, saving as duplicate')
                 fndest = os.path.join(fndir, '%s_._%s_._%s' % (str(fn_created_ts), fnparts[2], time.time()))
 
             fndest_zip = '%s.gz' % fndest
@@ -249,7 +269,7 @@ class MysqlBinlogStreamer(object):
                 if not os.path.isdir(fndir):
                     os.mkdir(fndir)
 
-                self.logger.debug('Found %s, moving to %s' % (fn, fndest))
+                logger.debug('Found %s, moving to %s' % (fn, fndest))
                 if not self.zip(fnpath, fndest_zip):
                     if os.path.isfile(fndest_zip):
                         os.unlink(fndest_zip)
@@ -279,25 +299,25 @@ class MysqlBinlogStreamer(object):
             fndest_part_zip = '%s.part.gz' % fndest
 
             if os.path.isfile(fndest_zip):
-                self.logger.debug('Removing stale %s' % fnpath)
+                logger.debug('Removing stale %s' % fnpath)
                 os.unlink(fnpath)
                 continue
             else:
                 skip = '%s.%s' % (self.ses_binlog_lst_prefix, next_binlog[-6:])
 
                 if skip == fn:
-                    self.logger.debug('%s is last tmp binlog, skipping partial save' % skip)
+                    logger.debug('%s is last tmp binlog, skipping partial save' % skip)
                     continue
 
-                self.logger.info('Full binlog %s is missing' % fndest)
-                self.logger.info('Filling with partial %s' % fnpath)
+                logger.info('Full binlog %s is missing' % fndest)
+                logger.info('Filling with partial %s' % fnpath)
 
                 if not os.path.isdir(fndir):
                     os.mkdir(fndir)
 
                 if os.path.isfile(fndest_part_zip):
-                    self.logger.warn('%s exists, skipping' % fndest_part_zip)
-                    self.logger.warn('Please check this binlog manually')
+                    logger.warn('%s exists, skipping' % fndest_part_zip)
+                    logger.warn('Please check this binlog manually')
                     continue
 
                 if not self.zip(fnpath, fndest_part_zip):
@@ -327,16 +347,16 @@ class MysqlBinlogStreamer(object):
             lstfd.close()
             if len(fnparts) == 3:
                 next_binlog = fnparts[2]
-                self.logger.debug('Binlog from lst file %s' % next_binlog)
+                logger.debug('Binlog from lst file %s' % next_binlog)
 
         if next_binlog is not None:
             if not self.binlog_exists_on_server(next_binlog):
-                self.logger.info('Recorded last binlog in session, '
+                logger.info('Recorded last binlog in session, '
                                  'has been purged')
-                self.logger.warn('Potential gap in downloaded binlogs, please review')
+                logger.warn('Potential gap in downloaded binlogs, please review')
                 next_binlog = None
             else:
-                self.logger.info('Recorded last binlog in session, '
+                logger.info('Recorded last binlog in session, '
                                  'streaming will start from %s' % next_binlog)
                 return next_binlog
 
@@ -352,17 +372,17 @@ class MysqlBinlogStreamer(object):
                     continue
 
                 next_binlog = self.normalize_binlog_name(binlogs[-1])
-                self.logger.info('Last binlog based on stored set %s' % next_binlog)
+                logger.info('Last binlog based on stored set %s' % next_binlog)
 
                 if not self.binlog_exists_on_server(next_binlog):
                     next_binlog = None
                     break
                 else:
                     next_binlog = '%s.%06d' % (next_binlog[:-7], (int(next_binlog[-6:])+1))
-                    self.logger.info('Next binlog is %s' % next_binlog)
+                    logger.info('Next binlog is %s' % next_binlog)
                     return next_binlog
 
-        self.logger.info('No recorded last binlog in session, '
+        logger.info('No recorded last binlog in session, '
                          'downloading all from source')
         return self.srv_binlog_first
 
@@ -396,20 +416,20 @@ class MysqlBinlogStreamer(object):
         sql = 'SHOW BINLOG EVENTS IN "%s" LIMIT 1' % binlog
         row = None
         try:
-            row = self.srv_cursor_fetchone(sql)
-        except MySQLdb.Error as err:
-            if err.args[0] == 2006:
+            row = self.mysql_client.fetchone(sql)
+        except MySQLError as err:
+            if err.errno == 2006:
                 self.srv_connect_ctl()
-                row = self.srv_cursor_fetchone(sql)
+                row = self.mysql_client.fetchone(sql)
             else:
                 if self.opts.debug:
                     traceback.print_exc()
-                self.logger.error(str(err))
-                self.logger.debug(sql)
-                self.logger.error('Binlog does not exist on server [%s]' % binlog)
+                logger.error(str(err))
+                logger.debug(sql)
+                logger.error('Binlog does not exist on server [%s]' % binlog)
                 return False
 
-        self.logger.debug('Binlog exists on server [%s]' % str(row))
+        logger.debug('Binlog exists on server [%s]' % str(row))
         return True
 
     def find_session_binlogs(self, prefix=None):
@@ -434,18 +454,13 @@ class MysqlBinlogStreamer(object):
         return binlogs
 
     def read_server_metadata(self):
-        cur = self.conn.cursor(MySQLdb.cursors.DictCursor)
-        cur.execute('SELECT @@hostname AS hn')
-        row = cur.fetchone()
+        row = self.mysql_client.fetchone('SELECT @@hostname AS hn')
         self.srv_hostname = row['hn']
-        cur.execute('SHOW BINARY LOGS')
-        row = cur.fetchone()
+        row = self.mysql_client.fetchone('SHOW BINARY LOGS')
         self.srv_binlog_first = row['Log_name']
-        cur.execute('SHOW MASTER STATUS')
-        row = cur.fetchone()
+        row = self.mysql_client.fetchone('SHOW MASTER STATUS')
         self.srv_binlog_last = row['File']
         self.srv_binlog_prefix = self.srv_binlog_last[:-7]
-        cur.close()
 
     def is_binlog_format(self, fn):
         if open(fn, 'rb').read(4) == '\xfebin':
@@ -491,7 +506,7 @@ class MysqlBinlogStreamer(object):
                 r = p.poll()
 
             if r != 0:
-                self.logger.error('Failed to compress with gzip, '
+                logger.error('Failed to compress with gzip, '
                                   'command was %s' % str(cmd_gzip))
             else:
                 os.rename('%s.gz' % binlog, dest)
@@ -506,7 +521,7 @@ class MysqlBinlogStreamer(object):
 
             return True
         except Exception as err:
-            self.logger.error(str(err))
+            logger.error(str(err))
             return False
 
     def unzip(self, binlog):

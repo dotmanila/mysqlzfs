@@ -4,10 +4,12 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import time
 from ... import *
 from ... import util as zfs_util
+from ... import zfs
 from ...constants import *
 from ...mysql import MySQLClient
 from collections import OrderedDict
@@ -37,6 +39,7 @@ class MysqlZfsSnapshotManager(object):
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
+        logger.info('Signal caught, cleaning up')
 
     def list_snapshots(self, refresh=False):
         if self.snaps is not None and refresh is False:
@@ -107,18 +110,21 @@ class MysqlZfsSnapshotManager(object):
 
             full_names.append(full_name)
 
-        last_type, last_snapname, last_set = self.find_last_export()
+        last_export_type, last_export_name, last_set = self.find_last_export()
         execute_full_snapshot = False
-        if snapdt.isoweekday() == 7 or self.bins is None or self.opts.full:
+        if (snapdt.isoweekday() == 7 or self.bins is None or self.opts.full) and \
+                (self.bins is not None and not self.opts.incr):
+            logger.info("Forcing full snapshot (i.e. Sunday, no previous snapshot or explicitly requested)")
             execute_full_snapshot = True
 
-        if last_type is not MYSQLZFS_EXPTYPE_NONE and int(last_snapname) >= int(snapname):
-            logger.info('Today\'s snapshot (%s) has already been exported' % snapname)
-            logger.info('Try exporting most recent snapshot with --incr/--full')
+        if last_export_type is not MYSQLZFS_EXPTYPE_NONE and int(last_export_name) >= int(snapname):
+            logger.info("Target snapshot (%s) has already been exported" % snapname)
+            logger.info("Last export was %s, last snapshot is %s" % (last_export_name, snapname))
+            logger.info("Try exporting most recent snapshot with --incr/--full")
             return True
 
         if not execute_full_snapshot:
-            snapprop, snaperr = zfs.get('%s@s%s' % (self.opts.dataset, last_snapname), ['origin'])
+            snapprop, snaperr = zfs.get('%s@s%s' % (self.opts.dataset, last_export_name), ['origin'])
             if snapprop is None:
                 logger.error('Looks like the source for incremental snapshot is missing')
                 logger.error(snaperr)
@@ -147,7 +153,7 @@ class MysqlZfsSnapshotManager(object):
                 binname = '_'.join(re.sub('@', '/', full_name).split('/')[::-1])
                 full_binname = os.path.join(full_binname, '%s_incr.zfs' % binname)
 
-                if not self.zfs_send_to_bin(full_name, full_binname, '@s%s' % last_snapname):
+                if not self.zfs_send_to_bin(full_name, full_binname, '@s%s' % last_export_name):
                     has_errors = True
                     break
 
@@ -162,12 +168,12 @@ class MysqlZfsSnapshotManager(object):
             return False
 
         self.list_binaries()
-        if len(self.bins) > 3:
+        if len(self.bins) > self.opts.retention_sets:
             logger.debug('Export sets list %s' % str(self.bins))
-            # delete only the oldes set when the newest one is full
+            # delete only the oldest set when the newest one is full
             # this means if we want to keep two weeks/sets, we make it three here
-            logger.debug('Pruning export sets %s' % str(list(self.bins.keys())[:-3]))
-            purge_list = list(self.bins.keys())[:-3]
+            purge_list = list(self.bins.keys())[:-self.opts.retention_sets]
+            logger.debug('Pruning export sets %s' % str(purge_list))
             for folder in purge_list:
                 purge_folder = os.path.join(self.opts.bindir, folder)
                 logger.info('Pruning export set %s' % purge_folder)
@@ -418,16 +424,11 @@ class MysqlZfsSnapshotManager(object):
         return True
 
     def zfs_destroy_dataset(self, dataset, recursive=True):
-        args = ['/sbin/zfs', 'destroy']
-        if recursive:
-            args.append('-r')
-        args.append(dataset)
+        success, error = zfs.destroy(dataset, recursive)
 
-        p = Popen(args, stdout=PIPE, stderr=PIPE)
-        out, err = p.communicate()
-        if err.decode('ascii') is not '':
-            logger.error(err.decode('ascii'))
-            return False
+        if not success:
+            logger.error(error)
+            return success
 
         return True
 
@@ -514,8 +515,9 @@ class MysqlZfsSnapshotManager(object):
                 'mysqlzfs_last_snapshot{dataset="%s"}' % self.opts.dataset,
                 int(time.time()), self.opts.metrics_text_dir)
 
-            logger.info('Pruning %d old snapshots' % len(self.snaps[:-431]))
-            for s in self.snaps[:-431]:
+            snapshots_prune_list = self.snaps[:-(self.opts.retention_sets-1)]
+            logger.info('Pruning %d old snapshots' % len(snapshots_prune_list))
+            for s in snapshots_prune_list:
                 logger.debug(' - %s@s%s' % (self.opts.dataset, s))
                 self.zfs_destroy_dataset('%s@s%s' % (self.opts.dataset, s))
 

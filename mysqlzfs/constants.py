@@ -21,6 +21,28 @@ VERSION_LESS = -1
 VERSION_HIGH = 1
 VERSION_INVALID = 2
 
+__backup_retention_sets = {
+    MYSQLZFS_CMD_SNAP: 432,
+    MYSQLZFS_CMD_EXPORT: 3,
+    MYSQLZFS_CMD_IMPORT: None,
+    MYSQLZFS_CMD_DUMP: 1,
+    MYSQLZFS_CMD_MYSQLD: None,
+    MYSQLZFS_CMD_CLONE: None,
+    MYSQLZFS_CMD_S3: 4,
+    MYSQLZFS_CMD_BINLOGD: None,
+}
+
+__backup_retention_days = {
+    MYSQLZFS_CMD_SNAP: 1,
+    MYSQLZFS_CMD_EXPORT: None,
+    MYSQLZFS_CMD_IMPORT: None,
+    MYSQLZFS_CMD_DUMP: None,
+    MYSQLZFS_CMD_MYSQLD: None,
+    MYSQLZFS_CMD_CLONE: None,
+    MYSQLZFS_CMD_S3: 4,
+    MYSQLZFS_CMD_BINLOGD: 30,
+}
+
 """ Copied from pymysqlreplication.constants.BINLOG.py, we do not need to import
 it here
 """

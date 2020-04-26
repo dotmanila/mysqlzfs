@@ -7,6 +7,7 @@ import sys
 from . import *
 from . import zfs
 from .constants import *
+from .constants import __backup_retention_sets, __backup_retention_days
 from collections import OrderedDict
 from configparser import ConfigParser, NoOptionError
 from datetime import datetime, timedelta
@@ -105,6 +106,9 @@ def buildopts():
     parser.add_option('-m', '--metrics-text-dir', dest='metrics_text_dir', type='string',
                       help='Emit textfile metrics to this directory for node_exporter',
                       default=None)
+    parser.add_option('-n', '--retention-sets', dest='retention_sets', type='int',
+                      help='How many backup sets to keep for export, dump, s3',
+                      default=None)
 
     (opts, args) = parser.parse_args()
 
@@ -180,6 +184,9 @@ def buildopts():
             opts.threads = int(cpus/2)
         else:
             opts.threads = 8
+
+    if opts.retention_sets is None:
+        opts.retention_sets = __backup_retention_sets[opts.cmd]
 
     return opts
 
@@ -282,12 +289,12 @@ def tsftime(unixtime, format = '%m/%d/%Y %H:%M:%S'):
     return d.strftime(format)
 
 
-def read_config_file(cfgfile):
-    if not os.path.isfile(cfgfile):
+def read_config_file(config_file):
+    if not os.path.isfile(config_file):
         return None
 
     cfg = ConfigParser(allow_no_value=True)
-    cfg.read(cfgfile)
+    cfg.read(config_file)
     return cfg
 
 
@@ -349,28 +356,6 @@ def is_process_running(pidno):
         return True
     else:
         return False
-
-
-def mysql_connect(dotmycnf, section='client'):
-    try:
-        cnf = read_config_file(dotmycnf)
-        if cnf is None:
-            raise Exception('Could not read provided %s' % dotmycnf)
-        elif not cnf.has_option(section, 'host'):
-            section = 'client'
-
-        if not cnf.has_option(section, 'host'):
-            raise Exception('.my.cnf %s group requires host option' % section)
-
-        params = { 'read_default_file': dotmycnf,
-                   'read_default_group': section }
-
-        conn = MySQLdb.connect(cnf.get(section, 'host'), **params)
-        # MySQLdb for some reason has autoccommit off by default
-        conn.autocommit(True)
-        return conn
-    except MySQLdb.Error as e:
-        raise Exception('Could not establish connection to MySQL server')
 
 
 def emit_text_metric(name, value, textdir):

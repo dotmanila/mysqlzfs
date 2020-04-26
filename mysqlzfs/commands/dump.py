@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import signal
+import shutil
 import time
 from .. import util as zfs_util
 from ..commands.mysqld import MysqlZfsService
@@ -29,6 +30,33 @@ def is_dump_complete(dump_dir):
                 return True
 
     return False
+
+
+def list_dumps(dumps_base_dir):
+    base_dir_files = os.listdir(dumps_base_dir)
+    base_dir_files.sort()
+    dumps = OrderedDict()
+
+    for d in base_dir_files:
+        dump_dir = os.path.join(dumps_base_dir, d)
+        if not os.path.isdir(dump_dir):
+            continue
+
+        if os.path.isfile(os.path.join(dump_dir, 'metadata')):
+            dumps[d] = OrderedDict({'status': 'Complete'})
+        elif os.path.isfile(os.path.join(dump_dir, 'metadata.partial')):
+            dumps[d] = OrderedDict({'status': 'Incomplete'})
+        else:
+            dumps[d] = OrderedDict({'status': 'Not Started'})
+
+        if os.path.isfile(os.path.join(dump_dir, 's3metadata')):
+            dumps[d]['s3'] = 'Complete'
+        elif os.path.isfile(os.path.join(dump_dir, 's3metadata.partial')):
+            dumps[d]['s3'] = 'Incomplete'
+        else:
+            dumps[d]['s3'] = 'Not Started'
+
+    return dumps
 
 
 def mydumper_version():
@@ -74,53 +102,51 @@ class MysqlDumper(object):
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
+        logger.info('Signal caught, cleaning up')
 
-    def start(self):
-        mysqlds = MysqlZfsServiceList(logger, self.opts, self.zfsmgr)
-        if self.opts.snapshot is None:
-            self.opts.snapshot = self.zfsmgr.snaps[-1]
+    def prune(self):
+        dumps = list_dumps(self.opts.dumpdir)
 
-        sandbox = mysqlds.scan_sandbox(self.opts.snapshot)
+        if len(dumps) == 0:
+            logger.info('No stored logical dumps found')
 
-        if sandbox is None:
-            if not self.zfsmgr.clone_snapshot():
-                raise Exception('Error cloning snapshot')
-        elif not sandbox:
-            raise Exception('Error checking cloned snapshot')
+        dumps_keys = list(dumps.keys())
+        prune_list = dumps_keys[0:len(dumps_keys)-self.opts.retention_sets]
 
-        mysqld = MysqlZfsService(logger, self.opts)
-        if not mysqld.is_alive() and not mysqld.start():
-            raise Exception('Could not start source instance')
+        if len(prune_list) == 0:
+            logger.info('No old logical dumps to prune')
 
-        logger.info('My own PID %d' % self.opts.ppid)
-        logger.info('Starting mydumper service on %s' % mysqld.rootdir)
+        for d in prune_list:
+            dump_dir = os.path.join(self.opts.dumpdir, d)
+            logger.info('Pruning dump %s' % dump_dir)
+            shutil.rmtree(dump_dir)
 
-        dump_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
-        meta_file = os.path.join(dump_dir, 'metadata')
-        dump_log = os.path.join(dump_dir, 'mydumper.log')
-        if not os.path.isdir(dump_dir):
-            os.mkdir(dump_dir)
+        return True
+
+    def execute_mydumper(self, dump_dir, defaults_file, mysqld_socket):
+        mydumper_log = os.path.join(dump_dir, 'mydumper.log')
+
         dumper = ['mydumper', '-F', '100', '-c', '-e', '-G', '-E', '-R',
                   '--less-locking', '-o', dump_dir, '--threads', str(self.opts.threads),
-                  '--socket', mysqld.cnf['mysqld']['socket'],
-                  '--defaults-file', self.opts.dotmycnf,
-                  '--logfile', dump_log]
+                  '--socket', mysqld_socket,
+                  '--defaults-file', defaults_file,
+                  '--logfile', mydumper_log]
         logger.debug('Running mydumper with %s' % ' '.join(dumper))
 
         p_dumper = Popen(dumper, stdout=PIPE, stderr=PIPE)
         r = p_dumper.poll()
         poll_count = 0
 
-        dumperpid, piderr = zfs_util.pidno_from_pstree(self.opts.ppid, 'mydumper')
-        logger.debug('mydumper pid %s' % str(dumperpid))
-        # print(zfs_util.proc_status(dumperpid))
+        mydumper_pid, pid_error = zfs_util.pidno_from_pstree(self.opts.ppid, 'mydumper')
+        logger.debug('mydumper pid %s' % str(mydumper_pid))
+        # print(zfs_util.proc_status(mydumper_pid))
 
         while r is None:
             time.sleep(2)
             p_dumper.poll()
             poll_count = poll_count + 1
 
-            if not os.path.isfile(dump_log):
+            if not os.path.isfile(mydumper_log):
                 if poll_count > 2:
                     out, err = p_dumper.communicate()
                     r = p_dumper.returncode
@@ -133,44 +159,57 @@ class MysqlDumper(object):
                 r = p_dumper.wait()
                 break
 
-        mysqld.stop()
-        self.zfsmgr.destroy_clone(self.opts.snapshot)
+        logger.info('mydumper process completed')
 
         if r != 0:
             logger.error('mydumper process returned with bad code: %d' % r)
-            logger.error('Check error log at %s' % dump_log)
+            logger.error('Check error log at %s' % mydumper_log)
             return False
 
-        logger.info('mydumper process completed')
+        return True
+
+    def start(self):
+        mysqlds = MysqlZfsServiceList(self.opts)
+        if self.opts.snapshot is None:
+            self.opts.snapshot = self.zfsmgr.snaps[-1]
+
+        sandbox = mysqlds.scan_sandbox(self.opts.snapshot)
+
+        if sandbox is None:
+            if not self.zfsmgr.clone_snapshot():
+                raise Exception('Error cloning snapshot')
+        elif not sandbox:
+            raise Exception('Error checking cloned snapshot')
+
+        dump_dir = os.path.join(self.opts.dumpdir, self.opts.snapshot)
+        if not os.path.isdir(dump_dir):
+            os.mkdir(dump_dir)
+        elif is_dump_complete(dump_dir):
+            logger.error('The directory %s already has completed dump data' % dump_dir)
+            return False
+
+        mysqld = MysqlZfsService(self.opts)
+        if not mysqld.is_alive() and not mysqld.start():
+            raise Exception('Could not start source instance')
+
+        logger.info('My own PID %d' % self.opts.ppid)
+        logger.info('Starting mydumper service on %s' % mysqld.rootdir)
+
+        self.execute_mydumper(dump_dir, defaults_file=self.opts.dotmycnf,
+                              mysqld_socket=mysqld.cnf['mysqld']['socket'])
+        mysqld.stop()
+        self.zfsmgr.destroy_clone(self.opts.snapshot)
 
         zfs_util.emit_text_metric(
             'mysqlzfs_last_dump{dataset="%s"}' % self.opts.dataset,
             int(time.time()), self.opts.metrics_text_dir)
 
+        self.prune()
+
         return True
 
     def status(self):
-        lsout = os.listdir(self.opts.dumpdir)
-        dumps = OrderedDict()
-
-        for d in lsout:
-            dumpdir = os.path.join(self.opts.dumpdir, d)
-            if not os.path.isdir(dumpdir):
-                continue
-
-            if os.path.isfile(os.path.join(dumpdir, 'metadata')):
-                dumps[d] = OrderedDict({'status': 'Complete'})
-            elif os.path.isfile(os.path.join(dumpdir, 'metadata.partial')):
-                dumps[d] = OrderedDict({'status': 'Incomplete'})
-            else:
-                dumps[d] = OrderedDict({'status': 'Not Started'})
-
-            if os.path.isfile(os.path.join(dumpdir, 's3metadata')):
-                dumps[d]['s3'] = 'Complete'
-            elif os.path.isfile(os.path.join(dumpdir, 's3metadata.partial')):
-                dumps[d]['s3'] = 'Incomplete'
-            else:
-                dumps[d]['s3'] = 'Not Started'
+        dumps = list_dumps(self.opts.dumpdir)
 
         if len(dumps) == 0:
             logger.info('No stored logical dumps found')

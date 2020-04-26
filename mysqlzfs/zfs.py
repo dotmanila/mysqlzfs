@@ -12,8 +12,18 @@ def snapshot():
     pass
 
 
-def destroy():
-    pass
+def destroy(dataset, recursive=True):
+    args = ['/sbin/zfs', 'destroy']
+    if recursive:
+        args.append('-r')
+    args.append(dataset)
+
+    p = Popen(args, stdout=PIPE, stderr=PIPE)
+    out, err = p.communicate()
+    if err.decode('ascii') is not '':
+        return False, err.decode('ascii')
+
+    return True, True
 
 
 def create():

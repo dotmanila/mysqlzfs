@@ -52,20 +52,20 @@ if __name__ == "__main__":
                 zfsmgr.show_binaries()
         elif opts.cmd == MYSQLZFS_CMD_CLONE:
             if opts.cleanup:
-                mysqlds = MysqlZfsServiceList(logger, opts, zfsmgr)
+                mysqlds = MysqlZfsServiceList(opts)
                 mysqlds.cleanup()
             elif opts.run:
                 success = zfsmgr.clone_snapshot()
                 if success and opts.stage:
-                    mysqld = MysqlZfsService(logger, opts)
+                    mysqld = MysqlZfsService(opts)
                     mysqld.start()
             else:
-                mysqlds = MysqlZfsServiceList(logger, opts, zfsmgr)
+                mysqlds = MysqlZfsServiceList(opts)
                 mysqlds.show_sandboxes()
         elif opts.cmd == MYSQLZFS_CMD_IMPORT:
             success = zfsmgr.import_bin(opts.snapshot)
             if success and opts.stage:
-                mysqld = MysqlZfsService(logger, opts)
+                mysqld = MysqlZfsService(opts)
                 mysqld.start()
         elif opts.cmd == MYSQLZFS_CMD_DUMP:
             dumper = MysqlDumper(opts, zfsmgr)
@@ -75,16 +75,16 @@ if __name__ == "__main__":
                 dumper.status()
         elif opts.cmd == MYSQLZFS_CMD_MYSQLD:
             if opts.stop:
-                mysqld = MysqlZfsService(logger, opts)
+                mysqld = MysqlZfsService(opts)
                 mysqld.stop()
             elif opts.start:
-                mysqld = MysqlZfsService(logger, opts)
+                mysqld = MysqlZfsService(opts)
                 mysqld.start()
             elif opts.cleanup:
-                mysqlds = MysqlZfsServiceList(logger, opts, zfsmgr)
+                mysqlds = MysqlZfsServiceList(opts)
                 mysqlds.cleanup()
             else:
-                mysqlds = MysqlZfsServiceList(logger, opts, zfsmgr)
+                mysqlds = MysqlZfsServiceList(opts)
                 mysqlds.show_sandboxes()
         elif opts.cmd == MYSQLZFS_CMD_SNAP:
             if opts.run:
@@ -100,7 +100,7 @@ if __name__ == "__main__":
                 logger.info('S3 command does not have status subcommand yet')
         elif opts.cmd == MYSQLZFS_CMD_BINLOGD:
             if opts.run:
-                binlogd = MysqlBinlogStreamer(logger, opts)
+                binlogd = MysqlBinlogStreamer(opts)
                 binlogd.start()
             else:
                 logger.info('binlogd command does not have status subcommand yet')

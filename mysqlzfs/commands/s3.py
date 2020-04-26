@@ -86,6 +86,7 @@ class MysqlS3Client(object):
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
+        logger.info('Signal caught, cleaning up')
 
     def reap_children(self, timeout=3):
         """ Tries hard to terminate and ultimately kill all the children of this process. """
