@@ -29,7 +29,7 @@ def compare_versions(version_string1, version_string2):
     try:
         version1 = version_string1.split('.')
         version2 = version_string2.split('.')
-        if len(version1) != len(version2) or len(version1) != 3 or len(version2) != 3:
+        if len(version1) != len(version2):
             return VERSION_INVALID
 
         v1_major, v1_minor, v1_point = version_string1.split('.')
@@ -50,11 +50,11 @@ def compare_versions(version_string1, version_string2):
 
         return VERSION_EQUAL
     except ValueError as err:
-        return None
+        return False
     except TypeError as err:
-        return None
+        return False
     except IndexError as err:
-        return None
+        return False
 
 
 def buildopts():

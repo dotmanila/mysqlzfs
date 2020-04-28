@@ -62,7 +62,7 @@ def list_dumps(dumps_base_dir):
 def mydumper_version():
     mydumper = zfs_util.which('mydumper')
     if mydumper is None:
-        return None
+        return False
 
     try:
         process = Popen([mydumper, '--version'], stdout=PIPE, stderr=PIPE)
@@ -70,13 +70,13 @@ def mydumper_version():
         version_string = out.decode('ascii').split(' ')[1].split(',')[0]
         high_or_equal = zfs_util.compare_versions(version_string, '0.9.5')
 
-        return VERSION_EQUAL or VERSION_HIGH
+        return True if high_or_equal in [VERSION_EQUAL, VERSION_HIGH] else False
     except ValueError as err:
-        return None
+        return False
     except TypeError as err:
-        return None
+        return False
     except IndexError as err:
-        return None
+        return False
 
 
 class MysqlDumper(object):

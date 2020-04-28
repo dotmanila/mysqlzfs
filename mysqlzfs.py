@@ -100,7 +100,8 @@ if __name__ == "__main__":
                 logger.info('S3 command does not have status subcommand yet')
         elif opts.cmd == MYSQLZFS_CMD_BINLOGD:
             if opts.run:
-                binlogd = MysqlBinlogStreamer(opts)
+                binlogd = MysqlBinlogStreamer(opts.binlogdir, mysql_defaults_file=opts.dotmycnf,
+                                              prometheus_text_dir=opts.metrics_text_dir)
                 binlogd.start()
             else:
                 logger.info('binlogd command does not have status subcommand yet')
