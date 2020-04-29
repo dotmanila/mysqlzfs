@@ -109,6 +109,9 @@ def buildopts():
     parser.add_option('-n', '--retention-sets', dest='retention_sets', type='int',
                       help='How many backup sets to keep for export, dump, s3',
                       default=None)
+    parser.add_option('-N', '--retention-days', dest='retention_days', type='int',
+                      help='How many days worth of backup to keep for binlogs',
+                      default=None)
 
     (opts, args) = parser.parse_args()
 
@@ -187,6 +190,13 @@ def buildopts():
 
     if opts.retention_sets is None:
         opts.retention_sets = __backup_retention_sets[opts.cmd]
+    elif opts.retention_sets < 1:
+        parser.error('Retention sets should be > 0')
+
+    if opts.retention_days is None:
+        opts.retention_days = __backup_retention_days[opts.cmd]
+    elif opts.retention_days < 1:
+        parser.error('Retention days should be > 0')
 
     return opts
 

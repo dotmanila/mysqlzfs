@@ -40,13 +40,13 @@ def mysqlbinlog_version(required_version='3.4'):
         return False
 
 
-def is_binlog_format(fn):
-    file_stats = os.stat(fn)
+def is_binlog_format(binlog_name):
+    file_stats = os.stat(binlog_name)
     # If file size is less than 120 bytes, we cannot even decode it
     if file_stats.st_size < 120:
         return False
 
-    with open(fn, 'rb') as binlog_file_fd:
+    with open(binlog_name, 'rb') as binlog_file_fd:
         magic = binlog_file_fd.read(4)
         if magic == b'\xfebin':
             return True
@@ -58,14 +58,34 @@ def list_binlogs_from_dir(binlog_dir):
     binlog_dir_list = os.listdir(binlog_dir)
     binlog_dir_list.sort()
     binary_logs = []
-    for fn in binlog_dir_list:
-        # We can check for self.is_binlog_format(os.path.join(binlogdir, fn))
+    for binlog_name in binlog_dir_list:
+        # We can check for self.is_binlog_format(os.path.join(binlogdir, binlog_name))
         # too but we are compressing binary_logs, have to think of how to do
         # that in the future
-        if len(fn.split('_._')) == 2:
-            binary_logs.append(fn)
+        if len(binlog_name.split('_._')) == 2 and re.search(r'\d+.gz$', binlog_name) is not None:
+            binary_logs.append(binlog_name)
 
     return binary_logs
+
+
+def list_binlog_store_days(binlog_store_dir):
+    """ List subdirectories in ascending order from binlog store directory
+    example /backups/mysql_test/binlog/ip-10-20-30-40/20200428
+
+    :param binlog_store_dir:
+    """
+    binlog_dir_list = os.listdir(binlog_store_dir)
+    binlog_dir_list.sort()
+    binlog_days = []
+
+    for binlog_dir in binlog_dir_list:
+        binlog_dir_path = os.path.join(binlog_store_dir, binlog_dir)
+        if not os.path.isdir(binlog_dir_path) or re.search(r'^\d{8}$', binlog_dir) is None:
+            continue
+
+        binlog_days.append(binlog_dir)
+
+    return binlog_days
 
 
 def byte2int(b):
@@ -77,22 +97,24 @@ def byte2int(b):
         return struct.unpack("!B", b)[0]
 
 
-def normalize_binlog_name(binname):
+def normalize_binlog_name(binlog_name):
     """ Take the actual binary log name from a file name
     i.e. tmp_._hostname_._mysql-bin.000004.gz -> mysql-bin.000004
     """
-    if binname == '':
+    if binlog_name == '':
         return ''
 
-    binlog = binname.split('_._')[-1]
-    if '.gz' == binlog[-3:]:
+    binlog = binlog_name.split('_._')[-1]
+    if '.part.gz' == binlog[-8:]:
+        return binlog[:-8]
+    elif '.gz' == binlog[-3:]:
         return binlog[:-3]
 
     return binlog
 
 
-def binlog_ts_created(fn):
-    with open(fn, 'rb') as fd:
+def binlog_ts_created(binlog_name):
+    with open(binlog_name, 'rb') as fd:
         fd.seek(4)
 
         # We look for the first write event in the binlog. mysqlbinlog writes
@@ -107,7 +129,7 @@ def binlog_ts_created(fn):
 
                 break
         except struct.error as err:
-            raise BinaryLogFormatError('Binary log %s has no valid write events' % fn)
+            raise BinaryLogFormatError('Binary log %s has no valid write events' % binlog_name)
 
     d = datetime.fromtimestamp(float(unpack[0]))
     return d.strftime('%Y%m%d%H%M%S')
@@ -209,7 +231,7 @@ class MysqlBinlogStreamer(object):
     binlog_dir = None
 
     def __init__(self, base_binlog_dir, mysql_defaults_file, prometheus_text_dir=None,
-                 prometheus_metrics_prefix='mysqlzfs_binlogd'):
+                 prometheus_metrics_prefix='mysqlzfs_binlogd', retention_days=30):
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
         self.base_binlog_dir = base_binlog_dir
@@ -217,6 +239,7 @@ class MysqlBinlogStreamer(object):
         self.mysql_defaults_file = mysql_defaults_file
         self.prometheus_text_dir = prometheus_text_dir
         self.prometheus_metrics_prefix = prometheus_metrics_prefix
+        self.retention_days = retention_days
 
     def _signal_handler(self, signal, frame):
         self.sigterm_caught = True
@@ -230,7 +253,6 @@ class MysqlBinlogStreamer(object):
             logger.info('Using %s to compress binary logs' % self.zip_binary)
 
         self.lockfile = os.path.join(self.base_binlog_dir, 'mysqlbinlog.lock')
-        self.srv_connect_ctl()
         self.read_server_metadata()
         self.ses_binlog_lst_prefix = 'lst_._%s_._%s' % (self.srv_hostname, self.srv_binlog_prefix)
         self.ses_binlog_lst_file = os.path.join(self.base_binlog_dir, self.ses_binlog_lst_prefix)
@@ -246,7 +268,7 @@ class MysqlBinlogStreamer(object):
                                                             key, self.srv_hostname),
                                   value, self.prometheus_text_dir)
 
-    def srv_connect_ctl(self):
+    def get_mysql_client(self):
         try:
             logger.debug('Establishing control connection to MySQL with %s' % self.mysql_defaults_file)
             defaults_file = zfs_util.read_config_file(self.mysql_defaults_file)
@@ -258,12 +280,14 @@ class MysqlBinlogStreamer(object):
             params = {'option_files': self.mysql_defaults_file,
                       'option_groups': 'mysqlbinlog'}
 
-            self.mysql_client = MySQLClient(params=params)
+            return MySQLClient(params=params)
         except MySQLError as err:
             raise Exception('Could not establish connection to MySQL server')
 
     def start(self):
         self.init_variables()
+        logger.info("Retention set for %d days" % self.retention_days)
+
         mysqlbinlog = get_mysqlbinlog_binary()
         self.is_running, self.pid = zfs_util.read_lock_file(self.lockfile)
         if self.is_running:
@@ -354,6 +378,7 @@ class MysqlBinlogStreamer(object):
         logger.debug('Starting session cleanup')
         self.session_cleanup_tmp(keep_last)
         self.session_cleanup_lst()
+        self.prune()
         logger.debug('Session cleanup complete')
 
     def session_cleanup_tmp(self, keep_last=False):
@@ -364,53 +389,54 @@ class MysqlBinlogStreamer(object):
         last_binlog = binlogs[-1]
         last_binlog_lst = last_binlog.replace('tmp_._', 'lst_._')
 
-        for fn in binlogs:
-            fnpath = os.path.join(self.base_binlog_dir, fn)
-            logger.debug(fnpath)
-            fnparts = fn.split('_._')
+        for binlog_tmp_file in binlogs:
+            binlog_tmp_path = os.path.join(self.base_binlog_dir, binlog_tmp_file)
+            logger.debug(binlog_tmp_path)
+            name_parts = binlog_tmp_file.split('_._')
 
             try:
-                fn_created_ts = binlog_ts_created(fnpath)
+                binlog_created_ts = binlog_ts_created(binlog_tmp_path)
             except BinaryLogFormatError as err:
-                os.unlink(fnpath)
+                os.unlink(binlog_tmp_path)
                 logger.error(str(err))
-                logger.error('%s is not a valid binary log' % fnpath)
+                logger.error('%s is not a valid binary log' % binlog_tmp_path)
                 continue
 
-            fndir = os.path.join(self.binlog_dir, fn_created_ts[:8])
-            fndest = os.path.join(fndir, '%s_._%s' % (str(fn_created_ts), fnparts[2]))
+            binlog_date_dir = os.path.join(self.binlog_dir, binlog_created_ts[:8])
+            binlog_dest = os.path.join(binlog_date_dir, '%s_._%s' % (str(binlog_created_ts), name_parts[2]))
 
-            if os.path.isfile(fndest):
+            if os.path.isfile(binlog_dest):
                 logger.error('Destination binlog exists, saving as duplicate')
-                fndest = os.path.join(fndir, '%s_._%s_._%s' % (str(fn_created_ts), fnparts[2], time.time()))
+                binlog_dest = os.path.join(binlog_date_dir,
+                                           '%s_._%s_._%s' % (str(binlog_created_ts), name_parts[2], time.time()))
 
-            fndest_zip = '%s.gz' % fndest
+            binlog_dest_zip = '%s.gz' % binlog_dest
             # We always assume the last binary log is not complete and start the
             # stream from there. But we also do not delete it automatically in case
             # starting the mysqlbinlog daemon fails and we need to determine
             # where to start again. We record it in a meta last file
-            if last_binlog == fn:
+            if last_binlog == binlog_tmp_file:
                 if keep_last:
                     break
 
-                with open(self.ses_binlog_lst_file, 'w') as lstfd:
-                    lstfd.write(last_binlog)
-                lstfd.close()
+                with open(self.ses_binlog_lst_file, 'w') as binlog_lst_fd:
+                    binlog_lst_fd.write(last_binlog)
+                binlog_lst_fd.close()
                 last_binlog_lst = os.path.join(self.base_binlog_dir, last_binlog_lst)
                 if os.path.isfile(last_binlog_lst):
                     os.unlink(last_binlog_lst)
-                os.rename(fnpath, last_binlog_lst)
+                os.rename(binlog_tmp_path, last_binlog_lst)
             else:
-                if not os.path.isdir(fndir):
-                    os.mkdir(fndir)
+                if not os.path.isdir(binlog_date_dir):
+                    os.mkdir(binlog_date_dir)
 
-                logger.debug('Found %s, moving to %s' % (fn, fndest))
-                if not self.zip(fnpath, fndest_zip):
-                    if os.path.isfile(fndest_zip):
-                        os.unlink(fndest_zip)
+                logger.debug('Found %s, moving to %s' % (binlog_tmp_file, binlog_dest))
+                if not self.zip(binlog_tmp_path, binlog_dest_zip):
+                    if os.path.isfile(binlog_dest_zip):
+                        os.unlink(binlog_dest_zip)
 
                     self.write_prometheus_metric('last_error', int(time.time()))
-                    raise Exception('Compression failed for %s' % fnpath)
+                    raise Exception('Compression failed for %s' % binlog_tmp_path)
 
         return True
 
@@ -421,88 +447,86 @@ class MysqlBinlogStreamer(object):
 
         next_binlog = self.find_next_binlog()
 
-        for fn in binlogs:
-            fnpath = os.path.join(self.base_binlog_dir, fn)
-            fnparts = fn.split('_._')
-            fn_created_ts = binlog_ts_created(fnpath)
-            fndir = os.path.join(self.binlog_dir, fn_created_ts[:8])
-            fndest = os.path.join(fndir, '%s_._%s' % (str(fn_created_ts), fnparts[2]))
-            fndest_zip = '%s.gz' % fndest
-            fndest_part_zip = '%s.part.gz' % fndest
+        for binlog_lst_file in binlogs:
+            binlog_lst_path = os.path.join(self.base_binlog_dir, binlog_lst_file)
+            name_parts = binlog_lst_file.split('_._')
+            binlog_created_ts = binlog_ts_created(binlog_lst_path)
+            binlog_date_dir = os.path.join(self.binlog_dir, binlog_created_ts[:8])
+            binlog_dest = os.path.join(binlog_date_dir, '%s_._%s' % (str(binlog_created_ts), name_parts[2]))
+            binlog_dest_zip = '%s.gz' % binlog_dest
+            binlog_dest_part_zip = '%s.part.gz' % binlog_dest
 
-            if os.path.isfile(fndest_zip):
-                logger.debug('Removing stale %s' % fnpath)
-                os.unlink(fnpath)
+            if os.path.isfile(binlog_dest_zip):
+                logger.debug('Removing stale %s' % binlog_lst_path)
+                os.unlink(binlog_lst_path)
                 continue
             else:
                 skip = '%s.%s' % (self.ses_binlog_lst_prefix, next_binlog[-6:])
 
-                if skip == fn:
+                if skip == binlog_lst_file:
                     logger.debug('%s is last tmp binlog, skipping partial save' % skip)
                     continue
 
-                logger.info('Full binlog %s is missing' % fndest)
-                logger.info('Filling with partial %s' % fnpath)
+                logger.info('Full binlog %s is missing' % binlog_dest)
+                logger.info('Filling with partial %s' % binlog_lst_path)
 
-                if not os.path.isdir(fndir):
-                    os.mkdir(fndir)
+                if not os.path.isdir(binlog_date_dir):
+                    os.mkdir(binlog_date_dir)
 
-                if os.path.isfile(fndest_part_zip):
-                    logger.warn('%s exists, skipping' % fndest_part_zip)
+                if os.path.isfile(binlog_dest_part_zip):
+                    logger.warn('%s exists, skipping' % binlog_dest_part_zip)
                     logger.warn('Please check this binlog manually')
                     continue
 
-                if not self.zip(fnpath, fndest_part_zip):
-                    if os.path.isfile(fndest_zip):
-                        os.unlink(fndest_zip)
+                if not self.zip(binlog_lst_path, binlog_dest_part_zip):
+                    if os.path.isfile(binlog_dest_zip):
+                        os.unlink(binlog_dest_zip)
 
                     self.write_prometheus_metric('last_error', int(time.time()))
-                    raise Exception('Compression failed for %s' % fnpath)
+                    raise Exception('Compression failed for %s' % binlog_lst_path)
 
         return True
 
-    def find_next_binlog(self):
-        """ Identify the next binlog to download
-        - Check if lst_._ file exists, make sure it still exists on source
-        - Check last file from hostname/binlogs, increment by one, make sure it still exists on source
-        - Default to first binlog on source
-        """
+    def find_next_binlog_from_lst_file(self):
         next_binlog = None
+
         if os.path.isfile(self.ses_binlog_lst_file):
-            with open(self.ses_binlog_lst_file, 'r') as lstfd:
-                for fn in lstfd:
-                    fnparts = fn.split('_._')
+            with open(self.ses_binlog_lst_file, 'r') as binlog_lst_fd:
+                for binlog_name in binlog_lst_fd:
+                    name_parts = binlog_name.split('_._')
                     break
-            lstfd.close()
-            if len(fnparts) == 3:
-                next_binlog = fnparts[2]
+            binlog_lst_fd.close()
+            if len(name_parts) == 3:
+                next_binlog = name_parts[2]
                 logger.debug('Binlog from lst file %s' % next_binlog)
 
-        if next_binlog is not None:
-            if not self.binlog_exists_on_server(next_binlog):
-                logger.info('Recorded last binlog in session, has been purged')
-                logger.warn('Potential gap in downloaded binlogs, please review')
-                next_binlog = None
-            else:
-                logger.info('Recorded last binlog in session, '
-                            'streaming will start from %s' % next_binlog)
-                return next_binlog
+        if next_binlog is None:
+            return None
 
-        binlog_dir_list = os.listdir(self.binlog_dir)
-        binlog_dir_list.sort()
+        if not self.binlog_exists_on_server(next_binlog):
+            logger.info('Recorded last binlog in session, has been purged')
+            logger.warn('Potential gap in downloaded binlogs, please review')
+            next_binlog = None
+        else:
+            logger.info('Recorded last binlog in session, '
+                        'streaming will start from %s' % next_binlog)
+
+        return next_binlog
+
+    def find_next_binlog_from_backup_store(self):
+        next_binlog = None
+
+        binlog_dir_list = list_binlog_store_days(self.binlog_dir)
         binlog_dir_list.reverse()
         for binlog_dir in binlog_dir_list:
             binlog_dir_path = os.path.join(self.binlog_dir, binlog_dir)
-            if not os.path.isdir(binlog_dir_path):
-                continue
-
             binlogs = list_binlogs_from_dir(binlog_dir_path)
             # We only need the last binlog from the newest dir
             if len(binlogs) == 0:
                 continue
 
             next_binlog = normalize_binlog_name(binlogs[-1])
-            logger.info('Last binlog based on stored set %s' % next_binlog)
+            logger.info('Last binlog from %s set %s' % (binlog_dir_path, next_binlog))
 
             if not self.binlog_exists_on_server(next_binlog):
                 next_binlog = None
@@ -510,40 +534,76 @@ class MysqlBinlogStreamer(object):
             else:
                 next_binlog = '%s.%06d' % (next_binlog[:-7], (int(next_binlog[-6:])+1))
                 logger.info('Next binlog is %s' % next_binlog)
-                return next_binlog
 
-        logger.info('No recorded last binlog in session, '
-                    'downloading all from source')
-        return self.srv_binlog_first
+        return next_binlog
+
+    def find_next_binlog(self):
+        """ Identify the next binlog to download
+        - Check if lst_._ file exists, make sure it still exists on source
+        - Check last file from hostname/binlogs, increment by one, make sure it still exists on source
+        - Default to first binlog on source
+        """
+        next_binlog = self.find_next_binlog_from_lst_file()
+        if next_binlog is None:
+            next_binlog = self.find_next_binlog_from_backup_store()
+
+        if next_binlog is None:
+            next_binlog = self.srv_binlog_first
+            logger.info('No recorded last binlog in session, '
+                        'downloading all from source')
+
+        return next_binlog
+
+    def prune(self):
+        binlog_days = list_binlog_store_days(self.binlog_dir)
+        binlog_days_length = len(binlog_days)
+
+        prune_tail = int(datetime.today().strftime('%Y%m%d')) - self.retention_days - 1
+        for binlog_day in binlog_days:
+            if int(binlog_day) >= prune_tail:
+                break
+
+            binlog_day_path = os.path.join(self.binlog_dir, binlog_day)
+            logger.info('Pruning %s' % binlog_day_path)
+            shutil.rmtree(binlog_day_path)
+
+        return True
 
     def binlog_exists_on_server(self, binlog):
         sql = 'SHOW BINLOG EVENTS IN "%s" LIMIT 1' % binlog
         row = None
+        mysql_client = None
         try:
-            row = self.mysql_client.fetchone(sql)
+            mysql_client = self.get_mysql_client()
+            row = mysql_client.fetchone(sql)
         except MySQLError as err:
             if err.errno == 2006:
-                self.srv_connect_ctl()
-                row = self.mysql_client.fetchone(sql)
+                mysql_client = self.get_mysql_client()
+                row = mysql_client.fetchone(sql)
             else:
-                if self.debug:
-                    traceback.print_exc()
+                # if self.debug:
+                #    traceback.print_exc()
                 logger.error(str(err))
                 logger.debug(sql)
                 logger.error('Binlog does not exist on server [%s]' % binlog)
                 return False
+        finally:
+            if mysql_client is not None and mysql_client.is_connected():
+                mysql_client.close()
 
         logger.debug('Binlog exists on server [%s]' % str(row))
         return True
 
     def read_server_metadata(self):
-        row = self.mysql_client.fetchone('SELECT @@hostname AS hn')
+        mysql_client = self.get_mysql_client()
+        row = mysql_client.fetchone('SELECT @@hostname AS hn')
         self.srv_hostname = row['hn']
-        row = self.mysql_client.fetchone('SHOW BINARY LOGS')
+        row = mysql_client.fetchone('SHOW BINARY LOGS')
         self.srv_binlog_first = row['Log_name']
-        row = self.mysql_client.fetchone('SHOW MASTER STATUS')
+        row = mysql_client.fetchone('SHOW MASTER STATUS')
         self.srv_binlog_last = row['File']
         self.srv_binlog_prefix = self.srv_binlog_last[:-7]
+        mysql_client.close()
 
     def zip(self, binlog, dest):
         if self.zip_binary is not None:

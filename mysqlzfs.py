@@ -101,7 +101,8 @@ if __name__ == "__main__":
         elif opts.cmd == MYSQLZFS_CMD_BINLOGD:
             if opts.run:
                 binlogd = MysqlBinlogStreamer(opts.binlogdir, mysql_defaults_file=opts.dotmycnf,
-                                              prometheus_text_dir=opts.metrics_text_dir)
+                                              prometheus_text_dir=opts.metrics_text_dir,
+                                              retention_days=opts.retention_days)
                 binlogd.start()
             else:
                 logger.info('binlogd command does not have status subcommand yet')

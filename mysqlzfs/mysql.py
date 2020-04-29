@@ -126,3 +126,6 @@ class MySQLClient(object):
 
     def close(self):
         self.conn.close()
+
+    def is_connected(self):
+        return self.conn.is_connected()
